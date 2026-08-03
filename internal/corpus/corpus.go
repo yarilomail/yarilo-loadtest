@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"math/rand"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -30,10 +31,20 @@ type Spec struct {
 }
 
 // Generator produces messages to Spec.
+//
+// Safe for concurrent use: a load driver calls this from every client at once,
+// and math/rand.Rand is not safe for that. Without the lock the RNG state tears
+// under -race — and, worse, silently under a normal run, which for a tool whose
+// output is a measurement means a corpus nobody can describe.
+//
+// The lock is not a bottleneck: generating a message is orders of magnitude
+// cheaper than delivering it.
 type Generator struct {
 	spec Spec
-	rnd  *rand.Rand
-	seq  int
+
+	mu  sync.Mutex
+	rnd *rand.Rand
+	seq int
 }
 
 func New(spec Spec) *Generator {
@@ -53,18 +64,24 @@ func New(spec Spec) *Generator {
 // Next renders one message as RFC 5322 bytes with CRLF line endings, which is
 // what a delivery agent receives on the wire.
 func (g *Generator) Generate(from, to string) []byte {
+	// Everything random is drawn under the lock; rendering happens outside it,
+	// since that is the part that costs anything.
+	g.mu.Lock()
 	g.seq++
+	seq := g.seq
 	size := g.spec.MinSize
 	if g.spec.MaxSize > g.spec.MinSize {
 		size += g.rnd.Intn(g.spec.MaxSize - g.spec.MinSize)
 	}
 	withAttachment := g.rnd.Float64() < g.spec.AttachmentRatio
+	msgID := g.rnd.Int63()
+	g.mu.Unlock()
 
 	var b bytes.Buffer
 	fmt.Fprintf(&b, "From: %s\r\n", from)
 	fmt.Fprintf(&b, "To: %s\r\n", to)
-	fmt.Fprintf(&b, "Subject: loadtest message %d\r\n", g.seq)
-	fmt.Fprintf(&b, "Message-Id: <lt-%d-%d@yarilo-loadtest>\r\n", g.rnd.Int63(), g.seq)
+	fmt.Fprintf(&b, "Subject: loadtest message %d\r\n", seq)
+	fmt.Fprintf(&b, "Message-Id: <lt-%d-%d@yarilo-loadtest>\r\n", msgID, seq)
 	fmt.Fprintf(&b, "Date: %s\r\n", time.Now().Format(time.RFC1123Z))
 	b.WriteString("MIME-Version: 1.0\r\n")
 

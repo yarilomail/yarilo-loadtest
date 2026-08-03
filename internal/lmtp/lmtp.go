@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/yarilomail/yarilo-loadtest/internal/corpus"
@@ -34,6 +35,12 @@ type Config struct {
 type Driver struct {
 	cfg Config
 	gen *corpus.Generator
+	// seq advances once per delivery, not once per client. Keying the
+	// recipient off the client instead pinned each one to a single mailbox, so
+	// a run touched as many mailboxes as it had clients however many were
+	// configured — and every measurement taken from it described a handful of
+	// mailboxes under many times the intended load.
+	seq atomic.Uint64
 }
 
 func New(cfg Config) *Driver {
@@ -54,7 +61,7 @@ func New(cfg Config) *Driver {
 // Each command is timed separately. DATA is the one that matters — the server
 // answers it only after the message is written and indexed, so its latency is
 // the delivery cost an operator actually experiences.
-func (d *Driver) Deliver(ctx context.Context, worker int, c *stats.Collector) error {
+func (d *Driver) Deliver(ctx context.Context, _ int, c *stats.Collector) error {
 	dialer := net.Dialer{Timeout: d.cfg.Timeout}
 	t0 := time.Now()
 	conn, err := dialer.DialContext(ctx, "tcp", d.cfg.Addr)
@@ -81,7 +88,7 @@ func (d *Driver) Deliver(ctx context.Context, worker int, c *stats.Collector) er
 		return err
 	}
 
-	rcpts := d.recipientsFor(worker)
+	rcpts := d.nextRecipients()
 	for _, rcpt := range rcpts {
 		if err := s.cmd("RCPT", "RCPT TO:<"+rcpt+">", "250"); err != nil {
 			return err
@@ -104,17 +111,25 @@ func (d *Driver) Deliver(ctx context.Context, worker int, c *stats.Collector) er
 	return s.cmd("QUIT", "QUIT", "221")
 }
 
-// recipientsFor picks this worker's recipients, walking the list so a run
-// spreads over accounts instead of hammering one mailbox — one mailbox would
-// measure lock contention on it rather than delivery throughput.
-func (d *Driver) recipientsFor(worker int) []string {
+// nextRecipients takes the next slice of the configured set, round-robin over
+// deliveries. Concurrency controls how many deliveries are in flight and
+// nothing about which mailboxes they reach: -recipients means "spread across
+// these", and a tool whose flag reads that way has to do it.
+func (d *Driver) nextRecipients() []string {
 	n := d.cfg.RecipientsPerMessage
 	if n > len(d.cfg.Recipients) {
 		n = len(d.cfg.Recipients)
 	}
+	// One counter increment per delivery, taking n consecutive addresses, so a
+	// fan-out run still walks the whole set rather than revisiting the first n.
+	start := int(d.seq.Add(uint64(n))) - n
 	out := make([]string, 0, n)
 	for i := 0; i < n; i++ {
-		out = append(out, d.cfg.Recipients[(worker+i)%len(d.cfg.Recipients)])
+		idx := (start + i) % len(d.cfg.Recipients)
+		if idx < 0 {
+			idx += len(d.cfg.Recipients)
+		}
+		out = append(out, d.cfg.Recipients[idx])
 	}
 	return out
 }
