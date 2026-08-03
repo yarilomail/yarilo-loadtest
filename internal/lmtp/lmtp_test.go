@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -176,30 +177,89 @@ func TestDeliverReadsOneReplyPerRecipient(t *testing.T) {
 	}
 }
 
-// Workers walk the recipient list rather than all hammering one mailbox —
-// otherwise the run measures contention on that mailbox, not delivery.
-func TestDeliverySpreadsAcrossRecipients(t *testing.T) {
+// The recipient is chosen per delivery, not per client. Keying it off the
+// client pinned each one to a single mailbox, so a run reached as many
+// mailboxes as it had clients however many were configured — and every
+// measurement taken from it described a few mailboxes under many times the
+// intended load.
+func TestDeliverySpreadsOverTheRecipientSetNotTheClientCount(t *testing.T) {
 	srv := &fakeLMTP{}
 	addr := srv.serve(t)
 
+	const recipients, clients, deliveries = 12, 3, 36
+	rcpts := make([]string, 0, recipients)
+	for i := 1; i <= recipients; i++ {
+		rcpts = append(rcpts, fmt.Sprintf("u%d@example.com", i))
+	}
 	d := lmtp.New(lmtp.Config{
 		Addr:       addr,
-		Recipients: []string{"u1@example.com", "u2@example.com", "u3@example.com"},
+		Recipients: rcpts,
 		Corpus:     corpus.Spec{MinSize: 1024, MaxSize: 1024, Seed: 3},
 		Timeout:    5 * time.Second,
 	})
-	for worker := 0; worker < 3; worker++ {
-		if err := d.Deliver(context.Background(), worker, stats.New()); err != nil {
-			t.Fatalf("worker %d: %v", worker, err)
-		}
+
+	var wg sync.WaitGroup
+	for i := 0; i < deliveries; i++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			if err := d.Deliver(context.Background(), worker%clients, stats.New()); err != nil {
+				t.Errorf("delivery: %v", err)
+			}
+		}(i)
 	}
+	wg.Wait()
+
 	seen := map[string]bool{}
 	for _, del := range srv.got() {
 		seen[del.recipients[0]] = true
 	}
-	if len(seen) != 3 {
-		t.Errorf("three workers delivered to %d distinct recipients: %v", len(seen), seen)
+	if len(seen) != recipients {
+		t.Errorf("%d deliveries from %d clients reached %d of %d mailboxes: %v",
+			deliveries, clients, len(seen), recipients, keys(seen))
 	}
+}
+
+// Fan-out walks the set too: a run with several recipients per message must not
+// revisit the same first few.
+func TestFanOutWalksTheWholeSet(t *testing.T) {
+	srv := &fakeLMTP{}
+	addr := srv.serve(t)
+
+	rcpts := make([]string, 0, 9)
+	for i := 1; i <= 9; i++ {
+		rcpts = append(rcpts, fmt.Sprintf("u%d@example.com", i))
+	}
+	d := lmtp.New(lmtp.Config{
+		Addr:                 addr,
+		Recipients:           rcpts,
+		RecipientsPerMessage: 3,
+		Corpus:               corpus.Spec{MinSize: 512, MaxSize: 512, Seed: 5},
+		Timeout:              5 * time.Second,
+	})
+	for i := 0; i < 3; i++ {
+		if err := d.Deliver(context.Background(), 0, stats.New()); err != nil {
+			t.Fatalf("delivery %d: %v", i, err)
+		}
+	}
+	seen := map[string]bool{}
+	for _, del := range srv.got() {
+		for _, r := range del.recipients {
+			seen[r] = true
+		}
+	}
+	if len(seen) != 9 {
+		t.Errorf("three 3-recipient deliveries reached %d of 9 mailboxes: %v", len(seen), keys(seen))
+	}
+}
+
+func keys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // A server that refuses must surface as an error rather than a silent success:

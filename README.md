@@ -47,6 +47,11 @@ yarilo-loadtest -protocol lmtp \
 shorthand which expands to `user1@domain … userN@domain` — matching how the
 sandbox names accounts, so a 150-user run does not need a 150-entry argument.
 
+A recipient is chosen **per delivery**, round-robin over the set. `-concurrency`
+controls how many deliveries are in flight and nothing about which mailboxes
+they reach: a run with 150 recipients touches 150 mailboxes whether it uses 4
+clients or 40.
+
 A run is bounded by `-duration` or `-iterations`. Setting neither is refused:
 an unbounded load run against a shared environment is somebody else's outage.
 
