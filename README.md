@@ -147,10 +147,17 @@ A table by default, `-json` for a job that has to decide whether the run passed:
 ```
 command             count   errors     ops/s    min ms    med ms    p95 ms    p99 ms    max ms
 ------------------------------------------------------------------------------------------
-DATA                 4820        0      80.3      3.11      8.42     24.10     41.88     92.30
-RCPT                 4820        0      80.3      0.21      0.44      1.02      2.11      8.40
+BODY                 2410        0      40.2    102.11    155.42    294.10    411.88    902.30
+DATA                 2410        0      40.2      0.09      0.11      0.32      0.71      2.40
+RCPT                 2410        0      40.2      0.21      0.44      1.02      2.11      8.40
 ...
 ```
+
+`DATA` is the command and its `354` reply; `BODY` is the transfer and the
+per-recipient replies that follow it. They are separate rows because they are
+separate measurements — microseconds against hundreds of milliseconds — and one
+row holding both is bimodal by construction, with a median that describes
+neither and a failure that cannot be attributed to either.
 
 Percentiles rather than a mean alone: a mean hides the tail, and the tail is
 what an operator notices.
