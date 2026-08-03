@@ -99,7 +99,9 @@ produces a git tag, a GitHub release with generated notes, and a semver image
 tag. Leave it alone and main is built and pushed as `latest` plus the commit
 sha, with no release.
 
-Images: `ghcr.io/yarilomail/yarilo-loadtest` and `docker.io/0kaba0/yarilo-loadtest`.
+Images are published to `ghcr.io/yarilomail/yarilo-loadtest`. Docker Hub is
+deliberately not a target yet: nothing outside the cluster consumes this image,
+and a second registry is a second thing to keep in sync for no reader.
 
 ## Licence
 
