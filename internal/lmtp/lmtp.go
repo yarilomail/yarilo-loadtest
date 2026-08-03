@@ -26,6 +26,8 @@ type Config struct {
 	RecipientsPerMessage int
 	Sender               string
 	Corpus               corpus.Spec
+	// Source overrides the generated corpus, for replaying real mail.
+	Source corpus.Source
 	// Timeout bounds one command, so a wedged server ends the run instead of
 	// hanging it.
 	Timeout time.Duration
@@ -34,7 +36,7 @@ type Config struct {
 // Driver delivers messages over LMTP.
 type Driver struct {
 	cfg Config
-	gen *corpus.Generator
+	gen corpus.Source
 	// seq advances once per delivery, not once per client. Keying the
 	// recipient off the client instead pinned each one to a single mailbox, so
 	// a run touched as many mailboxes as it had clients however many were
@@ -53,7 +55,11 @@ func New(cfg Config) *Driver {
 	if cfg.Sender == "" {
 		cfg.Sender = "loadtest@yarilo.invalid"
 	}
-	return &Driver{cfg: cfg, gen: corpus.New(cfg.Corpus)}
+	src := cfg.Source
+	if src == nil {
+		src = corpus.New(cfg.Corpus)
+	}
+	return &Driver{cfg: cfg, gen: src}
 }
 
 // Deliver runs one delivery: connect, LHLO, MAIL, RCPT×N, DATA, QUIT.

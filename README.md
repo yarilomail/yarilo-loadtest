@@ -106,6 +106,40 @@ whole bodies. Weights are relative, so one can be changed without rebalancing
 the rest, and selection is deterministic: two runs with one profile issue the
 same proportions, so a comparison differs by the server rather than by chance.
 
+### Corpus
+
+Two sources, for two different questions.
+
+**Generated** (default) — sizes and attachment ratio are yours to choose, and a
+seed makes the corpus reproducible byte for byte. Use it when the question is
+"how does cost scale with message size", which is what the size flags exist for.
+
+**Replayed** — `-mbox=/path/to/test.mbox` delivers the messages in an mbox file,
+cycling. Use it when the question is "is this server slower than that one":
+comparing two runs means comparing the same work, and the same corpus is the
+only way to be sure of that. Line endings are normalised to CRLF and the mbox
+`>From ` escaping is undone, so a replayed message is the one that was stored.
+
+### Live output
+
+A line per interval on stderr while the run is going, with a column per command
+and one for errors:
+
+```
+  time   APPEND    FETCH    STORE   SEARCH  errors
+    1s       28      31       14        6       0
+    2s       27      33       15        5       0
+    3s        4       6        2        1      12
+```
+
+Each line reports **that interval**, not the run so far. A summary tells you a
+run was bad; this tells you when it went bad, which is usually the question — a
+rate that collapses at forty seconds and a rate that was never good average to
+the same number.
+
+It goes to stderr, so `-json` on stdout stays machine-readable. `-interval 0`
+turns it off.
+
 ### Output
 
 A table by default, `-json` for a job that has to decide whether the run passed:
@@ -150,6 +184,8 @@ Kubernetes Job fails without anything parsing the output.
 | `-mailboxes` | — | explicit per-user mailbox names |
 | `-mailboxes-per-user` | 0 | generate `Load1 … LoadN` instead of a list |
 | `-create-mailboxes` | true | create the set before the run |
+| `-mbox` | — | replay messages from an mbox file instead of generating them |
+| `-interval` | 1s | live table interval; 0 disables |
 | `-json` | false | machine-readable summary |
 
 Ramp-up is not cosmetic: starting hundreds of connections in the same
