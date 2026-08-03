@@ -35,12 +35,14 @@ type Config struct {
 
 	Profile Profile
 	Corpus  corpus.Spec
+	// Source overrides the generated corpus, for replaying real mail.
+	Source corpus.Source
 }
 
 // Driver runs persistent IMAP sessions.
 type Driver struct {
 	cfg       Config
-	gen       *corpus.Generator
+	gen       corpus.Source
 	mailboxes []string
 	weights   []weighted
 	// seq numbers operations across all sessions, so the command mix and the
@@ -61,7 +63,11 @@ func New(cfg Config) (*Driver, error) {
 	if cfg.Profile == (Profile{}) {
 		cfg.Profile = DefaultProfile()
 	}
-	d := &Driver{cfg: cfg, gen: corpus.New(cfg.Corpus), weights: cfg.Profile.weights()}
+	src := cfg.Source
+	if src == nil {
+		src = corpus.New(cfg.Corpus)
+	}
+	d := &Driver{cfg: cfg, gen: src, weights: cfg.Profile.weights()}
 	if len(d.weights) == 0 {
 		return nil, fmt.Errorf("imap: every command has zero weight")
 	}

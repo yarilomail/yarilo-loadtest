@@ -55,6 +55,9 @@ var (
 	flagProfileStr = flag.String("profile", "",
 		"command weights, e.g. 'append=30,fetch=30,store=15,search=5'; empty uses the default mix")
 
+	flagMbox     = flag.String("mbox", "", "replay messages from this mbox file instead of generating them")
+	flagInterval = flag.Duration("interval", time.Second, "how often to print the live table; 0 disables it")
+
 	flagJSON = flag.Bool("json", false, "emit the summary as JSON instead of a table")
 )
 
@@ -71,19 +74,32 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	src, serr := messageSource()
+	if serr != nil {
+		fail("%v", serr)
+	}
+
 	c := stats.New()
+	// The live table goes to stderr so -json on stdout stays machine-readable:
+	// a run watched by a human and a run parsed by a job are the same run.
+	done := make(chan struct{})
+	if *flagInterval > 0 && !*flagJSON {
+		go stats.NewLive(c, os.Stderr, *flagInterval).Run(done)
+	}
+
 	var err error
 	switch strings.ToLower(*flagProtocol) {
 	case "lmtp":
-		err = runLMTP(ctx, c)
+		err = runLMTP(ctx, c, src)
 	case "imap":
-		err = runIMAP(ctx, c)
+		err = runIMAP(ctx, c, src)
 	case "":
 		fail("-protocol is required (lmtp | imap)")
 	default:
 		fail("unknown protocol %q", *flagProtocol)
 	}
 
+	close(done)
 	summary := c.Summary()
 	if *flagJSON {
 		if werr := summary.WriteJSON(os.Stdout); werr != nil {
@@ -103,7 +119,7 @@ func main() {
 	}
 }
 
-func runLMTP(ctx context.Context, c *stats.Collector) error {
+func runLMTP(ctx context.Context, c *stats.Collector, src corpus.Source) error {
 	rcpts := expandRecipients(*flagRecipients)
 	if len(rcpts) == 0 {
 		fail("-recipients is required for the lmtp driver")
@@ -114,6 +130,7 @@ func runLMTP(ctx context.Context, c *stats.Collector) error {
 		RecipientsPerMessage: *flagRcptPerMsg,
 		Sender:               *flagSender,
 		Timeout:              *flagTimeout,
+		Source:               src,
 		Corpus: corpus.Spec{
 			MinSize:         *flagMinSize,
 			MaxSize:         *flagMaxSize,
@@ -137,7 +154,22 @@ func runLMTP(ctx context.Context, c *stats.Collector) error {
 	})
 }
 
-func runIMAP(ctx context.Context, c *stats.Collector) error {
+// messageSource picks the corpus: a replayed mbox when one is given, generated
+// mail otherwise. Replay is for comparing against a reference run on the same
+// corpus; generation is for choosing sizes deliberately.
+func messageSource() (corpus.Source, error) {
+	if *flagMbox == "" {
+		return nil, nil
+	}
+	m, err := corpus.LoadMbox(*flagMbox)
+	if err != nil {
+		return nil, err
+	}
+	slog.Info("loadtest: corpus loaded", "mbox", *flagMbox, "messages", m.Len())
+	return m, nil
+}
+
+func runIMAP(ctx context.Context, c *stats.Collector, src corpus.Source) error {
 	users := expandRecipients(*flagUsers)
 	if len(users) == 0 {
 		fail("-users is required for the imap driver")

@@ -30,6 +30,13 @@ type Spec struct {
 	Seed int64
 }
 
+// Source is where a driver gets messages. Two implementations: a generator,
+// for choosing sizes deliberately, and an mbox replay, for running the same
+// corpus a reference run was given.
+type Source interface {
+	Generate(from, to string) []byte
+}
+
 // Generator produces messages to Spec.
 //
 // Safe for concurrent use: a load driver calls this from every client at once,
