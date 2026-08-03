@@ -27,7 +27,7 @@ so a before/after comparison compares one thing.
 | Driver | State |
 |:---|:---|
 | LMTP | implemented — delivery storm, configurable sizes and fan-out |
-| IMAP | planned |
+| IMAP | implemented — APPEND/FETCH/STORE/SEARCH over a configurable mailbox set |
 | POP3 | planned |
 | JMAP | planned |
 
@@ -58,6 +58,32 @@ therefore compares the same mail, not the same order.
 
 A run is bounded by `-duration` or `-iterations`. Setting neither is refused:
 an unbounded load run against a shared environment is somebody else's outage.
+
+### IMAP
+
+```sh
+yarilo-loadtest -protocol imap \
+  -addr yarilo-imap:143 \
+  -users 'u@d00001.test:150' -password secret \
+  -mailboxes-per-user 10 \
+  -concurrency 20 -duration 5m \
+  -op-append 3 -op-fetch 3 -op-store 2 -op-search 2
+```
+
+The **mailbox set is the point**. A generator that works only in INBOX cannot
+produce the condition worth testing against a server that dispatches index work
+per user: several mailboxes of one user wanting indexing at once. Either name
+them (`-mailboxes=INBOX,Archive,Work`) or generate them
+(`-mailboxes-per-user=10` → `Load1 … Load10`), and they are created before the
+clock starts so the run measures operations rather than setup.
+
+User and mailbox are chosen **per operation**, like the LMTP recipient.
+`-concurrency` controls how many operations are in flight and nothing about
+where they land.
+
+The mix is deterministic: with even weights, 16 operations are 4 of each. Two
+runs with the same flags issue the same operations, so a comparison differs by
+the server rather than by the generator.
 
 ### Output
 
@@ -95,6 +121,13 @@ Kubernetes Job fails without anything parsing the output.
 | `-min-size` / `-max-size` | 2048 / 8192 | message size bounds, bytes |
 | `-attachment-ratio` | 0 | fraction carrying a base64 attachment |
 | `-seed` | time-based | corpus seed; one seed generates one corpus |
+| `-users` | — | IMAP users, list or `user@domain:N` |
+| `-password` | — | password for every user |
+| `-tls` / `-insecure` | false | implicit TLS; skip certificate verification |
+| `-mailboxes` | — | explicit per-user mailbox names |
+| `-mailboxes-per-user` | 0 | generate `Load1 … LoadN` instead of a list |
+| `-create-mailboxes` | true | create the set before the run |
+| `-op-append` / `-op-fetch` / `-op-store` / `-op-search` | 3/3/2/2 | operation mix weights |
 | `-json` | false | machine-readable summary |
 
 Ramp-up is not cosmetic: starting hundreds of connections in the same
