@@ -31,6 +31,10 @@ type Config struct {
 	// Without it a run's mailboxes grow all the way through, so an operation at
 	// the end costs more than the same operation at the start and the numbers
 	// are not comparable with each other, let alone between runs.
+	//
+	// Zero disables the steady state, which is what a read-only run needs: a
+	// search profile that has to append a hundred messages first is measuring
+	// the append path it was written to exclude.
 	TargetMessages int
 
 	Profile Profile
@@ -57,8 +61,8 @@ func New(cfg Config) (*Driver, error) {
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = 30 * time.Second
 	}
-	if cfg.TargetMessages <= 0 {
-		cfg.TargetMessages = 100
+	if cfg.TargetMessages < 0 {
+		return nil, fmt.Errorf("imap: -msgs must not be negative")
 	}
 	if cfg.Profile == (Profile{}) {
 		cfg.Profile = DefaultProfile()
@@ -206,12 +210,16 @@ func (d *Driver) step(ctx context.Context, s *session, c *stats.Collector) error
 	// The client's own appends count towards the target even before the server
 	// has reported them: otherwise a server that only sends EXISTS on the next
 	// command would be appended to without bound in between.
-	held := s.view.exists + s.view.appended
-	if held < d.cfg.TargetMessages {
-		return d.run(s, cmdAppend, c)
-	}
-	if held > d.cfg.TargetMessages*2 {
-		return d.run(s, cmdExpunge, c)
+	// Skipped entirely when the steady state is off, or a run with no target
+	// would read "hold zero messages" as "expunge everything, forever".
+	if d.cfg.TargetMessages > 0 {
+		held := s.view.exists + s.view.appended
+		if held < d.cfg.TargetMessages {
+			return d.run(s, cmdAppend, c)
+		}
+		if held > d.cfg.TargetMessages*2 {
+			return d.run(s, cmdExpunge, c)
+		}
 	}
 
 	cmd := pick(d.weights, n)

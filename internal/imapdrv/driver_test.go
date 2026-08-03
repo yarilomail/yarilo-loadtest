@@ -34,6 +34,19 @@ type fakeIMAP struct {
 	dropAppend bool
 }
 
+// issued counts how many times a verb reached the server.
+func (f *fakeIMAP) issued(verb string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var n int
+	for _, c := range f.commands {
+		if c == verb {
+			n++
+		}
+	}
+	return n
+}
+
 func newFake() *fakeIMAP {
 	return &fakeIMAP{appended: map[string]int{}, counts: map[string]int{}}
 }
@@ -412,5 +425,53 @@ func TestParseProfile(t *testing.T) {
 				t.Errorf("err = %v, wantErr = %t", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+// A read-only run must not write. -msgs=0 used to be silently promoted to 100,
+// so a "search only" profile appended a hundred messages per client before it
+// searched anything — the run measured the path it was written to exclude, and
+// said nothing about having done so.
+func TestZeroTargetDisablesTheSteadyState(t *testing.T) {
+	srv := newFake()
+	addr := srv.serve(t)
+	d := testDriver(t, addr, imapdrv.Config{
+		Users: []string{"u1@example.com"}, MailboxesPerUser: 1,
+		TargetMessages: 0,
+		// The read-only shape: only SEARCH is weighted. If the steady state
+		// still ran, it would append regardless of the weights, because it is
+		// consulted before the profile is.
+		Profile: imapdrv.Profile{Search: 1},
+	})
+
+	runFor(t, d, 0, stats.New(), 300*time.Millisecond)
+
+	stored, searches := srv.counts["Load1"], srv.issued("SEARCH")
+
+	if stored != 0 {
+		t.Errorf("a run with -msgs=0 stored %d messages; it was asked to read, not write", stored)
+	}
+	if searches == 0 {
+		t.Error("no SEARCH was issued; the run did nothing at all, so the check above proves nothing")
+	}
+}
+
+// The other half: zero must not be read as "hold nothing, so expunge
+// everything". The expunge rule fires above twice the target, and twice zero is
+// zero — a run against a mailbox somebody else filled would have emptied it.
+func TestZeroTargetDoesNotExpunge(t *testing.T) {
+	srv := newFake()
+	srv.counts = map[string]int{"Load1": 50}
+	addr := srv.serve(t)
+	d := testDriver(t, addr, imapdrv.Config{
+		Users: []string{"u1@example.com"}, MailboxesPerUser: 1,
+		TargetMessages: 0,
+		Profile:        imapdrv.Profile{Noop: 1},
+	})
+
+	runFor(t, d, 0, stats.New(), 300*time.Millisecond)
+
+	if expunges := srv.issued("EXPUNGE"); expunges > 0 {
+		t.Errorf("a run with -msgs=0 issued %d EXPUNGEs against a mailbox it did not fill", expunges)
 	}
 }
