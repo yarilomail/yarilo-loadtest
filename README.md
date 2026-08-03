@@ -52,6 +52,10 @@ controls how many deliveries are in flight and nothing about which mailboxes
 they reach: a run with 150 recipients touches 150 mailboxes whether it uses 4
 clients or 40.
 
+With `-seed`, one seed produces one corpus: the same set of messages, though
+which client sends which is decided by scheduling. A before/after comparison
+therefore compares the same mail, not the same order.
+
 A run is bounded by `-duration` or `-iterations`. Setting neither is refused:
 an unbounded load run against a shared environment is somebody else's outage.
 

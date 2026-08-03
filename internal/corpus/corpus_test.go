@@ -3,6 +3,7 @@ package corpus_test
 import (
 	"net/mail"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/yarilomail/yarilo-loadtest/internal/corpus"
@@ -95,5 +96,51 @@ func TestSeedIsReproducible(t *testing.T) {
 		if string(a.Generate("x@y.z", "p@q.r")) != string(b.Generate("x@y.z", "p@q.r")) {
 			t.Fatalf("message %d differs between two runs with one seed", i)
 		}
+	}
+}
+
+// The tool calls this from every client at once, and math/rand.Rand is not safe
+// for that. The race was live from the first release: single-goroutine tests
+// could not see it, and a run without -race would have corrupted the corpus
+// silently rather than failing — which for a measuring tool is the worse
+// outcome.
+func TestGeneratorIsSafeForConcurrentUse(t *testing.T) {
+	g := corpus.New(corpus.Spec{MinSize: 2048, MaxSize: 16 << 10, AttachmentRatio: 0.5, Seed: 9})
+
+	const workers, each = 16, 25
+	var wg sync.WaitGroup
+	ids := make(chan string, workers*each)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < each; j++ {
+				raw := g.Generate("a@b.c", "d@e.f")
+				msg, err := mail.ReadMessage(strings.NewReader(string(raw)))
+				if err != nil {
+					t.Errorf("concurrent generation produced unparseable mail: %v", err)
+					return
+				}
+				ids <- msg.Header.Get("Message-Id")
+			}
+		}()
+	}
+	wg.Wait()
+	close(ids)
+
+	// Every message must be distinct: a torn sequence counter would repeat one,
+	// and a delivery run would then be indexing the same Message-Id twice.
+	seen := make(map[string]bool, workers*each)
+	for id := range ids {
+		if id == "" {
+			t.Fatal("a concurrently generated message has no Message-Id")
+		}
+		if seen[id] {
+			t.Fatalf("duplicate Message-Id %q under concurrency", id)
+		}
+		seen[id] = true
+	}
+	if len(seen) != workers*each {
+		t.Errorf("got %d distinct messages, want %d", len(seen), workers*each)
 	}
 }
