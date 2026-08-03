@@ -145,13 +145,23 @@ turns it off.
 A table by default, `-json` for a job that has to decide whether the run passed:
 
 ```
-command             count   errors     ops/s    min ms    med ms    p95 ms    p99 ms    max ms
-------------------------------------------------------------------------------------------
-BODY                 2410        0      40.2    102.11    155.42    294.10    411.88    902.30
-DATA                 2410        0      40.2      0.09      0.11      0.32      0.71      2.40
-RCPT                 2410        0      40.2      0.21      0.44      1.02      2.11      8.40
+command             count   errors    cancel     ops/s    min ms    med ms    p95 ms    p99 ms    max ms
+--------------------------------------------------------------------------------------------------
+BODY                 2410        0         8      40.2    102.11    155.42    294.10    411.88    902.30
+DATA                 2410        0         0      40.2      0.09      0.11      0.32      0.71      2.40
+RCPT                 2410        0         0      40.2      0.21      0.44      1.02      2.11      8.40
 ...
+
+ran for 120.0s, 0 errors, 8 cancelled at the deadline
 ```
+
+`errors` means the server did something wrong. `cancel` counts the operations
+the run cut off when `-duration` expired — one per client that was mid-command
+at the time, so a clean run has roughly `-concurrency` of them and **zero**
+errors. Counting those as failures is what an earlier version did, and it made
+every clean run report failures that scaled with the load; `-stop-on-error`
+could not be used for the job it exists for, because the noise it fired on was
+its own.
 
 `DATA` is the command and its `354` reply; `BODY` is the transfer and the
 per-recipient replies that follow it. They are separate rows because they are

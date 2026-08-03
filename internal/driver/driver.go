@@ -53,6 +53,14 @@ func Run(ctx context.Context, opts Options, c *stats.Collector, fn Worker) error
 		defer cancel()
 	}
 
+	// Reaching the bound cancels every client mid-operation, and each of those
+	// operations then fails with the cancellation. Counting those as protocol
+	// errors made a clean run report roughly one failure per client — a number
+	// that grows with -concurrency and describes the tool stopping, not the
+	// server. The collector holds the same context, so it can tell the two
+	// apart at the moment the failure is reported.
+	c.BindRun(runCtx)
+
 	var (
 		wg        sync.WaitGroup
 		mu        sync.Mutex

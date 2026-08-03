@@ -4,6 +4,7 @@
 package stats
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -20,9 +21,18 @@ type Collector struct {
 	// start is when the run began, so throughput is derived rather than
 	// guessed from the duration that was requested.
 	start time.Time
+	// run is the context bounding the run. Once it is done, an in-flight
+	// operation failing means the tool cut it off, not that the server refused
+	// it — a clean run must report zero errors however many clients were in
+	// flight when the clock ran out.
+	run context.Context
 }
 
 type command struct {
+	// cancelled counts operations cut off when the run ended. They are not
+	// failures: the tool stopped, not the server.
+	cancelled int
+
 	// samples holds every latency. A load run is bounded by duration or
 	// iterations, so this stays proportional to the work actually done —
 	// exact percentiles are worth more here than a fixed-bucket histogram
@@ -33,6 +43,29 @@ type command struct {
 
 func New() *Collector {
 	return &Collector{cmds: make(map[string]*command), start: time.Now()}
+}
+
+// BindRun gives the collector the context that bounds the run, so a failure can
+// be attributed to the run ending rather than to the server.
+//
+// The cut is made by the context and not by inspecting the error, because the
+// same error means different things on either side of it: a deadline that
+// expires while the run is live is the server being slow, and one that expires
+// because the run ended is the tool closing the connection.
+//
+// Binding the context rather than being told "stopping" is what makes this
+// race-free: a worker cancelled by this context necessarily sees it already
+// done when it reports the failure, so there is no window in which the
+// cancellation is counted as a fault.
+func (c *Collector) BindRun(ctx context.Context) {
+	c.mu.Lock()
+	c.run = ctx
+	c.mu.Unlock()
+}
+
+// cancelling reports whether the run has ended. Callers hold c.mu.
+func (c *Collector) cancelling() bool {
+	return c.run != nil && c.run.Err() != nil
 }
 
 // Observe records one command. err non-nil counts as a failure and its latency
@@ -46,7 +79,11 @@ func (c *Collector) Observe(name string, d time.Duration, err error) {
 		c.cmds[name] = cmd
 	}
 	cmd.samples = append(cmd.samples, d)
-	if err != nil {
+	switch {
+	case err == nil:
+	case c.cancelling():
+		cmd.cancelled++
+	default:
 		cmd.errors++
 	}
 }
@@ -56,6 +93,9 @@ type Summary struct {
 	DurationSeconds float64            `json:"durationSeconds"`
 	Commands        map[string]CmdStat `json:"commands"`
 	Errors          int                `json:"errors"`
+	// Cancelled counts operations the run cut off at its own deadline. A clean
+	// run has some of these — roughly one per client — and zero errors.
+	Cancelled int `json:"cancelled"`
 }
 
 // CmdStat is one command's outcome. Percentiles rather than a mean alone: a
@@ -63,6 +103,7 @@ type Summary struct {
 type CmdStat struct {
 	Count     int     `json:"count"`
 	Errors    int     `json:"errors"`
+	Cancelled int     `json:"cancelled"`
 	PerSecond float64 `json:"perSecond"`
 	MinMs     float64 `json:"minMs"`
 	MedianMs  float64 `json:"medianMs"`
@@ -85,6 +126,7 @@ func (c *Collector) Summary() Summary {
 		out.Commands[name] = CmdStat{
 			Count:     len(sorted),
 			Errors:    cmd.errors,
+			Cancelled: cmd.cancelled,
 			PerSecond: float64(len(sorted)) / elapsed,
 			MinMs:     ms(percentile(sorted, 0)),
 			MedianMs:  ms(percentile(sorted, 0.50)),
@@ -93,6 +135,7 @@ func (c *Collector) Summary() Summary {
 			MaxMs:     ms(percentile(sorted, 1)),
 		}
 		out.Errors += cmd.errors
+		out.Cancelled += cmd.cancelled
 	}
 	return out
 }
@@ -116,15 +159,16 @@ func (s Summary) WriteTable(w io.Writer) {
 	}
 	sort.Strings(names)
 
-	fmt.Fprintf(w, "%-16s %8s %8s %9s %9s %9s %9s %9s %9s\n",
-		"command", "count", "errors", "ops/s", "min ms", "med ms", "p95 ms", "p99 ms", "max ms")
-	fmt.Fprintln(w, strings.Repeat("-", 100))
+	fmt.Fprintf(w, "%-16s %8s %8s %9s %9s %9s %9s %9s %9s %9s\n",
+		"command", "count", "errors", "cancel", "ops/s", "min ms", "med ms", "p95 ms", "p99 ms", "max ms")
+	fmt.Fprintln(w, strings.Repeat("-", 110))
 	for _, name := range names {
 		c := s.Commands[name]
-		fmt.Fprintf(w, "%-16s %8d %8d %9.1f %9.2f %9.2f %9.2f %9.2f %9.2f\n",
-			name, c.Count, c.Errors, c.PerSecond, c.MinMs, c.MedianMs, c.P95Ms, c.P99Ms, c.MaxMs)
+		fmt.Fprintf(w, "%-16s %8d %8d %9d %9.1f %9.2f %9.2f %9.2f %9.2f %9.2f\n",
+			name, c.Count, c.Errors, c.Cancelled, c.PerSecond, c.MinMs, c.MedianMs, c.P95Ms, c.P99Ms, c.MaxMs)
 	}
-	fmt.Fprintf(w, "\nran for %.1fs, %d errors\n", s.DurationSeconds, s.Errors)
+	fmt.Fprintf(w, "\nran for %.1fs, %d errors, %d cancelled at the deadline\n",
+		s.DurationSeconds, s.Errors, s.Cancelled)
 }
 
 func (s Summary) WriteJSON(w io.Writer) error {
