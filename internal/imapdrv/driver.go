@@ -20,42 +20,31 @@ type Config struct {
 	Insecure bool
 	Timeout  time.Duration
 
-	// Mailboxes is the per-user set the run works over. Empty means INBOX
-	// alone, which is what a generator that cannot spread looks like — and the
-	// reason this option exists.
-	Mailboxes []string
-	// MailboxesPerUser generates Load1 … LoadN in place of an explicit list, so
-	// a run can be scaled without editing one.
+	// Mailboxes is the per-user set the run works over. A generator confined to
+	// INBOX cannot produce the condition a per-user dispatcher is worth testing
+	// against: several mailboxes of one user wanting work at once.
+	Mailboxes        []string
 	MailboxesPerUser int
-	// CreateMailboxes makes the set before the run. A mailbox that already
-	// exists is not an error.
-	CreateMailboxes bool
+	CreateMailboxes  bool
 
-	// Ops is the operation mix, by weight. Zero-weight operations never run.
-	Ops    OpMix
-	Corpus corpus.Spec
+	// TargetMessages is the message count each client keeps its mailbox near.
+	// Without it a run's mailboxes grow all the way through, so an operation at
+	// the end costs more than the same operation at the start and the numbers
+	// are not comparable with each other, let alone between runs.
+	TargetMessages int
+
+	Profile Profile
+	Corpus  corpus.Spec
 }
 
-// OpMix weights the operations. APPEND and STORE are what queue index work,
-// SEARCH is what reads it back — a mix without all three measures half the
-// system.
-type OpMix struct {
-	Append int
-	Fetch  int
-	Store  int
-	Search int
-}
-
-func (m OpMix) total() int { return m.Append + m.Fetch + m.Store + m.Search }
-
-// Driver runs the IMAP mix.
+// Driver runs persistent IMAP sessions.
 type Driver struct {
 	cfg       Config
 	gen       *corpus.Generator
 	mailboxes []string
-	// seq advances once per operation. Selection is per operation, not per
-	// client: keying it off the client would pin each one to a single user and
-	// mailbox, which is the defect this driver was asked for in the first place.
+	weights   []weighted
+	// seq numbers operations across all sessions, so the command mix and the
+	// mailbox rotation are properties of the run rather than of one client.
 	seq atomic.Uint64
 }
 
@@ -66,10 +55,16 @@ func New(cfg Config) (*Driver, error) {
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = 30 * time.Second
 	}
-	if cfg.Ops.total() == 0 {
-		cfg.Ops = OpMix{Append: 3, Fetch: 3, Store: 2, Search: 2}
+	if cfg.TargetMessages <= 0 {
+		cfg.TargetMessages = 100
 	}
-	d := &Driver{cfg: cfg, gen: corpus.New(cfg.Corpus)}
+	if cfg.Profile == (Profile{}) {
+		cfg.Profile = DefaultProfile()
+	}
+	d := &Driver{cfg: cfg, gen: corpus.New(cfg.Corpus), weights: cfg.Profile.weights()}
+	if len(d.weights) == 0 {
+		return nil, fmt.Errorf("imap: every command has zero weight")
+	}
 
 	switch {
 	case len(cfg.Mailboxes) > 0:
@@ -84,11 +79,10 @@ func New(cfg Config) (*Driver, error) {
 	return d, nil
 }
 
-// Mailboxes reports the resolved set, for the run's own logging.
 func (d *Driver) Mailboxes() []string { return d.mailboxes }
 
-// Prepare creates the mailbox set for every user. Done once before the run so
-// the measured operations are not half mailbox creation.
+// Prepare creates the mailbox set for every user, before the clock starts: a
+// run whose first operations are CREATE measures setup.
 func (d *Driver) Prepare(ctx context.Context) error {
 	if !d.cfg.CreateMailboxes {
 		return nil
@@ -119,18 +113,53 @@ func (d *Driver) Prepare(ctx context.Context) error {
 	return nil
 }
 
-// Run performs one operation: connect, log in, act, disconnect.
+// RunClient is one persistent client: it logs in once and issues commands over
+// the same connection until the run ends, reconnecting only when the profile
+// says LOGOUT or the connection fails.
 //
-// A connection per operation is deliberate for now. It costs a login per
-// operation, which the stats show separately, and it keeps the mailbox
-// selection honest — a long-lived connection would tempt the driver to reuse
-// whatever it had selected, which is how load ends up concentrated on one
-// mailbox without anybody deciding that.
-func (d *Driver) Run(ctx context.Context, _ int, c *stats.Collector) error {
-	n := d.seq.Add(1) - 1
-	user := d.cfg.Users[int(n)%len(d.cfg.Users)]
-	mailbox := d.mailboxes[int(n/uint64(len(d.cfg.Users)))%len(d.mailboxes)]
-	op := d.pickOp(n)
+// This is the shape imaptest uses, and the reason is not tidiness. IMAP spends
+// its resources per session — the index handle, the cached mailbox view,
+// hibernation — and a generator that reconnects per operation measures the
+// login path instead of any of that.
+func (d *Driver) RunClient(ctx context.Context, id int, c *stats.Collector) error {
+	s := &session{}
+	defer func() {
+		if s.cl != nil {
+			s.cl.close()
+		}
+	}()
+
+	for ctx.Err() == nil {
+		if s.state == stateDisconnected {
+			if err := d.connect(ctx, s, id, c); err != nil {
+				return err
+			}
+		}
+		if err := d.step(ctx, s, c); err != nil {
+			// A failed command drops the session rather than being retried on
+			// it: after an error the connection's state is not known, and
+			// continuing on a connection whose state is a guess produces
+			// failures that belong to the generator.
+			if s.cl != nil {
+				s.cl.close()
+				s.cl = nil
+			}
+			s.state = stateDisconnected
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+func (d *Driver) connect(ctx context.Context, s *session, id int, c *stats.Collector) error {
+	// Each client owns one user for its lifetime — that is what a user is: a
+	// person with a session, not a label attached to individual commands. The
+	// spread comes from having more clients than the run has users, and from
+	// mailbox rotation within the session.
+	s.user = d.cfg.Users[id%len(d.cfg.Users)]
 
 	t0 := time.Now()
 	cl, err := dial(d.cfg.Addr, d.cfg.TLS, d.cfg.Insecure, d.cfg.Timeout)
@@ -138,92 +167,150 @@ func (d *Driver) Run(ctx context.Context, _ int, c *stats.Collector) error {
 	if err != nil {
 		return err
 	}
-	defer cl.close()
+	s.cl = cl
 
 	t0 = time.Now()
-	err = cl.login(user, d.cfg.Password)
+	err = cl.login(s.user, d.cfg.Password)
 	c.Observe("LOGIN", time.Since(t0), err)
 	if err != nil {
-		return err
+		cl.close()
+		s.cl = nil
+		return fmt.Errorf("imap: login %s: %w", s.user, err)
+	}
+	s.state = stateAuthenticated
+	s.view = view{}
+	_ = ctx
+	return nil
+}
+
+// step issues one command, choosing it from the profile and skipping any the
+// current state forbids.
+func (d *Driver) step(ctx context.Context, s *session, c *stats.Collector) error {
+	n := d.seq.Add(1) - 1
+
+	// A session that has nothing open must open something before the profile
+	// gets a say: the alternative is a client that spends the run rejecting its
+	// own choices.
+	if !s.selected() {
+		return d.doSelect(s, n, c)
+	}
+	// The steady state comes before the profile too. Without it the mailbox
+	// grows for the whole run and every later operation costs more than the
+	// same operation did earlier.
+	// The client's own appends count towards the target even before the server
+	// has reported them: otherwise a server that only sends EXISTS on the next
+	// command would be appended to without bound in between.
+	held := s.view.exists + s.view.appended
+	if held < d.cfg.TargetMessages {
+		return d.run(s, cmdAppend, c)
+	}
+	if held > d.cfg.TargetMessages*2 {
+		return d.run(s, cmdExpunge, c)
 	}
 
-	t0 = time.Now()
-	err = cl.selectMailbox(mailbox)
-	c.Observe("SELECT", time.Since(t0), err)
+	cmd := pick(d.weights, n)
+	for i := 0; !s.legal(cmd) && i < len(d.weights); i++ {
+		cmd = pick(d.weights, n+uint64(i)+1)
+	}
+	if !s.legal(cmd) {
+		cmd = cmdNoop
+	}
+	_ = ctx
+	return d.run(s, cmd, c)
+}
+
+func (d *Driver) doSelect(s *session, n uint64, c *stats.Collector) error {
+	mbox := d.mailboxes[int(n)%len(d.mailboxes)]
+	t0 := time.Now()
+	lines, err := s.cl.do("SELECT " + quoted(mbox))
+	c.Observe(string(cmdSelect), time.Since(t0), err)
 	if err != nil {
 		return err
 	}
+	s.state = stateSelected
+	s.view = view{mailbox: mbox}
+	s.view.applyUntagged(lines)
+	return s.checkMismatch()
+}
 
-	if err := d.runOp(cl, op, user, mailbox, c); err != nil {
+// run issues one command and folds its untagged responses into the client's
+// view of the mailbox.
+func (d *Driver) run(s *session, cmd command, c *stats.Collector) error {
+	t0 := time.Now()
+	var (
+		lines []string
+		err   error
+	)
+	switch cmd {
+	case cmdList:
+		lines, err = s.cl.do(`LIST "" "*"`)
+	case cmdStatus:
+		lines, err = s.cl.do("STATUS " + quoted(s.view.mailbox) + " (MESSAGES UNSEEN)")
+	case cmdSelect:
+		c.Observe(string(cmdSelect), 0, nil) // counted inside doSelect
+		return d.doSelect(s, d.seq.Add(1)-1, c)
+	case cmdFetch:
+		// Metadata for the whole mailbox: what a client does when it opens a
+		// folder.
+		lines, err = s.cl.do(d.rangeCmd(s, "FETCH", "(UID FLAGS RFC822.SIZE)"))
+	case cmdFetch2:
+		// Whole bodies for a bounded window. Bounded because an unbounded body
+		// fetch grows with the run, and because this is the path whose cost
+		// decides where message prefetching belongs.
+		lines, err = s.cl.do(d.rangeCmd(s, "FETCH", "BODY.PEEK[]"))
+	case cmdStore:
+		lines, err = s.cl.do(d.rangeCmd(s, "STORE", `+FLAGS.SILENT (\Seen)`))
+	case cmdDelete:
+		// Marking, not removing: EXPUNGE is a separate command in the profile,
+		// so the two can be weighted independently as they are on a real server.
+		lines, err = s.cl.do(d.rangeCmd(s, "STORE", `+FLAGS.SILENT (\Deleted)`))
+	case cmdExpunge:
+		lines, err = s.cl.do("EXPUNGE")
+	case cmdSearch:
+		lines, err = s.cl.do("SEARCH TEXT throughput")
+	case cmdNoop:
+		lines, err = s.cl.do("NOOP")
+	case cmdAppend:
+		err = s.cl.appendMessage(s.view.mailbox, d.gen.Generate("loadtest@yarilo.invalid", s.user))
+		if err == nil {
+			// Only what this client did. exists comes from the server alone —
+			// incrementing it here would compare the client's bookkeeping
+			// against itself, which is a check that can never fail.
+			s.view.appended++
+		}
+	case cmdLogout:
+		lines, err = s.cl.do("LOGOUT")
+		if err == nil {
+			s.cl.close()
+			s.cl = nil
+			s.state = stateDisconnected
+		}
+	}
+	c.Observe(string(cmd), time.Since(t0), err)
+	if err != nil {
 		return err
 	}
-
-	t0 = time.Now()
-	_, err = cl.do("LOGOUT")
-	c.Observe("LOGOUT", time.Since(t0), err)
-	return err
+	s.commands++
+	s.view.applyUntagged(lines)
+	// The check that makes this a test rather than a generator: a server that
+	// accepted appends and stored nothing answers every command with OK, and
+	// only the count gives it away.
+	return s.checkMismatch()
 }
 
-// op names one operation of the mix.
-type op string
-
-const (
-	opAppend op = "APPEND"
-	opFetch  op = "FETCH"
-	opStore  op = "STORE"
-	opSearch op = "SEARCH"
-)
-
-// pickOp walks the weighted mix deterministically. Deterministic rather than
-// random so two runs with the same flags issue the same operations in the same
-// proportion — a comparison should differ by what changed on the server, not by
-// what the generator felt like doing.
-func (d *Driver) pickOp(n uint64) op {
-	m := d.cfg.Ops
-	slot := int(n % uint64(m.total()))
-	switch {
-	case slot < m.Append:
-		return opAppend
-	case slot < m.Append+m.Fetch:
-		return opFetch
-	case slot < m.Append+m.Fetch+m.Store:
-		return opStore
-	default:
-		return opSearch
+// rangeCmd bounds a sequence-set command to the newest messages. "1:*" was the
+// obvious form and the wrong one: its cost grows with the mailbox, so the same
+// operation is cheap at the start of a run and expensive at the end, and no two
+// measurements from one run are comparable.
+func (d *Driver) rangeCmd(s *session, verb, args string) string {
+	const window = 20
+	from := s.view.exists - window + 1
+	if from < 1 {
+		from = 1
 	}
-}
-
-func (d *Driver) runOp(cl *client, o op, user, mailbox string, c *stats.Collector) error {
-	t0 := time.Now()
-	var err error
-	switch o {
-	case opAppend:
-		err = cl.appendMessage(mailbox, d.gen.Generate("loadtest@yarilo.invalid", user))
-	case opFetch:
-		// Whole bodies, not headers: this is the path whose cost is unmeasured
-		// and which decides where message prefetching belongs.
-		_, err = cl.do("FETCH 1:* BODY.PEEK[]")
-	case opStore:
-		// Flag churn is what queues index work without adding messages.
-		_, err = cl.do(`STORE 1:* +FLAGS.SILENT (\Seen)`)
-	case opSearch:
-		// A term the corpus actually contains, so the search does the work of
-		// matching rather than the work of finding nothing.
-		_, err = cl.do("SEARCH TEXT throughput")
+	to := s.view.exists
+	if to < 1 {
+		to = 1
 	}
-	c.Observe(string(o), time.Since(t0), err)
-	// An empty mailbox answers FETCH and STORE with a NO; that is the mailbox
-	// being empty, not the server failing, and counting it as an error would
-	// make every fresh run look broken.
-	if err != nil && isEmptyMailbox(err) {
-		return nil
-	}
-	return err
-}
-
-func isEmptyMailbox(err error) bool {
-	msg := strings.ToUpper(err.Error())
-	return strings.Contains(msg, "NO SUCH MESSAGE") ||
-		strings.Contains(msg, "INVALID MESSAGE SET") ||
-		strings.Contains(msg, "NO MESSAGES")
+	return fmt.Sprintf("%s %d:%d %s", verb, from, to, args)
 }

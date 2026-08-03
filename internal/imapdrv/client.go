@@ -25,9 +25,6 @@ type client struct {
 	conn net.Conn
 	br   *bufio.Reader
 	tag  atomic.Uint64
-	// selected is the mailbox this connection has open, so the driver can skip
-	// a redundant SELECT without tracking it itself.
-	selected string
 }
 
 func dial(addr string, useTLS, insecure bool, timeout time.Duration) (*client, error) {
@@ -175,18 +172,6 @@ func (c *client) create(mailbox string) error {
 		return nil
 	}
 	return err
-}
-
-func (c *client) selectMailbox(mailbox string) error {
-	if c.selected == mailbox {
-		return nil
-	}
-	if _, err := c.do("SELECT " + quoted(mailbox)); err != nil {
-		c.selected = ""
-		return err
-	}
-	c.selected = mailbox
-	return nil
 }
 
 // appendMessage writes a message with a synchronising literal: the server

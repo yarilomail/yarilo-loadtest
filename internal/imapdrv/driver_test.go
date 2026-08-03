@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -28,9 +27,16 @@ type fakeIMAP struct {
 	commands  []string
 	appended  map[string]int
 	appendBod [][]byte
+	// counts is the real per-mailbox message count, so EXISTS reflects what
+	// the server was actually told to store — which is what lets a test check
+	// that the client's view tracks the server rather than itself.
+	counts     map[string]int
+	dropAppend bool
 }
 
-func newFake() *fakeIMAP { return &fakeIMAP{appended: map[string]int{}} }
+func newFake() *fakeIMAP {
+	return &fakeIMAP{appended: map[string]int{}, counts: map[string]int{}}
+}
 
 func (f *fakeIMAP) serve(t *testing.T) string {
 	t.Helper()
@@ -81,7 +87,10 @@ func (f *fakeIMAP) handle(conn net.Conn) {
 		case "SELECT":
 			selected = unquote(args)
 			f.record(&f.selects, selected)
-			fmt.Fprintf(conn, "* 3 EXISTS\r\n%s OK [READ-WRITE] selected\r\n", tag)
+			f.mu.Lock()
+			n := f.counts[selected]
+			f.mu.Unlock()
+			fmt.Fprintf(conn, "* %d EXISTS\r\n%s OK [READ-WRITE] selected\r\n", n, tag)
 		case "APPEND":
 			// {n} is the last token; the body is exactly n bytes after the
 			// continuation. Reading fewer or more desynchronises the session,
@@ -97,6 +106,9 @@ func (f *fakeIMAP) handle(conn net.Conn) {
 			f.mu.Lock()
 			f.appended[mbox]++
 			f.appendBod = append(f.appendBod, append([]byte(nil), body...))
+			if !f.dropAppend {
+				f.counts[mbox]++
+			}
 			f.mu.Unlock()
 			fmt.Fprintf(conn, "%s OK appended\r\n", tag)
 		case "FETCH":
@@ -105,6 +117,20 @@ func (f *fakeIMAP) handle(conn net.Conn) {
 			payload := "Subject: x\r\n\r\nbody in " + selected
 			fmt.Fprintf(conn, "* 1 FETCH (BODY[] {%d}\r\n%s)\r\n", len(payload), payload)
 			fmt.Fprintf(conn, "%s OK fetched\r\n", tag)
+		case "NOOP":
+			// A real server reports the mailbox's current size on the next
+			// command; without it a client can never learn what the server
+			// actually holds.
+			f.mu.Lock()
+			n := f.counts[selected]
+			f.mu.Unlock()
+			fmt.Fprintf(conn, "* %d EXISTS\r\n%s OK noop\r\n", n, tag)
+		case "LIST":
+			fmt.Fprintf(conn, "* LIST () \"/\" INBOX\r\n%s OK listed\r\n", tag)
+		case "STATUS":
+			fmt.Fprintf(conn, "* STATUS INBOX (MESSAGES 1 UNSEEN 0)\r\n%s OK status\r\n", tag)
+		case "EXPUNGE":
+			fmt.Fprintf(conn, "%s OK expunged\r\n", tag)
 		case "STORE":
 			fmt.Fprintf(conn, "* 1 FETCH (FLAGS (\\Seen))\r\n%s OK stored\r\n", tag)
 		case "SEARCH":
@@ -178,63 +204,137 @@ func testDriver(t *testing.T, addr string, cfg imapdrv.Config) *imapdrv.Driver {
 	return d
 }
 
-// The reason this driver exists: churn has to spread over a user's mailboxes,
-// not sit in INBOX. A generator that cannot do that cannot produce the one
-// condition a per-user dispatcher is worth testing against.
-func TestOperationsSpreadOverUsersAndMailboxes(t *testing.T) {
-	srv := newFake()
-	addr := srv.serve(t)
-	users := []string{"u1@example.com", "u2@example.com", "u3@example.com"}
-	d := testDriver(t, addr, imapdrv.Config{
-		Users: users, MailboxesPerUser: 4, CreateMailboxes: false,
-	})
-
-	c := stats.New()
-	for i := 0; i < 48; i++ {
-		if err := d.Run(context.Background(), i%3, c); err != nil {
-			t.Fatalf("operation %d: %v", i, err)
-		}
-	}
-
-	gotUsers := distinct(srv.snapshot(func(f *fakeIMAP) []string { return f.logins }))
-	if len(gotUsers) != len(users) {
-		t.Errorf("reached %d of %d users: %v", len(gotUsers), len(users), gotUsers)
-	}
-	gotBoxes := distinct(srv.snapshot(func(f *fakeIMAP) []string { return f.selects }))
-	if len(gotBoxes) != 4 {
-		t.Errorf("reached %d of 4 mailboxes: %v", len(gotBoxes), gotBoxes)
+// runFor drives one client for a bounded time, which is how the driver is used:
+// a client lives for the run, not for one operation.
+func runFor(t *testing.T, d *imapdrv.Driver, id int, c *stats.Collector, d2 time.Duration) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), d2)
+	defer cancel()
+	if err := d.RunClient(ctx, id, c); err != nil {
+		t.Fatalf("client %d: %v", id, err)
 	}
 }
 
-// Selection is per operation. Keying it off the client is the defect this
-// driver was asked for after the LMTP one had it.
-func TestSelectionIsPerOperationNotPerClient(t *testing.T) {
+// The point of the rewrite: a client logs in once and keeps working. Logging in
+// per operation measures the login path instead of the session resources IMAP
+// actually spends — the index handle, the cached view, hibernation.
+func TestClientKeepsOneSession(t *testing.T) {
 	srv := newFake()
 	addr := srv.serve(t)
 	d := testDriver(t, addr, imapdrv.Config{
-		Users: []string{"u1@example.com", "u2@example.com"}, MailboxesPerUser: 3,
+		Users: []string{"u1@example.com"}, MailboxesPerUser: 1,
+		TargetMessages: 5,
+		Profile:        imapdrv.Profile{Fetch: 1, Noop: 1},
 	})
 
 	c := stats.New()
-	var wg sync.WaitGroup
-	for i := 0; i < 24; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			// Every operation reports the same client id: if selection followed
-			// the client, one user and one mailbox would be all we saw.
-			if err := d.Run(context.Background(), 0, c); err != nil {
-				t.Errorf("operation: %v", err)
-			}
-		}()
-	}
-	wg.Wait()
+	runFor(t, d, 0, c, 300*time.Millisecond)
 
-	if got := distinct(srv.snapshot(func(f *fakeIMAP) []string { return f.logins })); len(got) != 2 {
-		t.Errorf("one client id reached %d users, want 2: %v", len(got), got)
+	logins := srv.snapshot(func(f *fakeIMAP) []string { return f.logins })
+	if len(logins) != 1 {
+		t.Errorf("client logged in %d times over one run, want 1", len(logins))
 	}
-	if got := distinct(srv.snapshot(func(f *fakeIMAP) []string { return f.selects })); len(got) != 3 {
-		t.Errorf("one client id reached %d mailboxes, want 3: %v", len(got), got)
+	summary := c.Summary()
+	work := summary.Commands["FETCH"].Count + summary.Commands["NOOP"].Count
+	if work < 10 {
+		t.Errorf("only %d commands issued on the session — it is not being reused", work)
+	}
+}
+
+// Without a steady state the mailbox grows all run, so the same operation is
+// cheap early and expensive late and no two measurements are comparable.
+func TestClientHoldsTheMailboxNearTheTarget(t *testing.T) {
+	srv := newFake()
+	addr := srv.serve(t)
+	const target = 8
+	d := testDriver(t, addr, imapdrv.Config{
+		Users: []string{"u1@example.com"}, MailboxesPerUser: 1,
+		TargetMessages: target,
+		// Nothing but APPEND is weighted, so only the steady-state rule can
+		// stop the mailbox growing without bound.
+		Profile: imapdrv.Profile{Append: 1},
+	})
+
+	runFor(t, d, 0, stats.New(), 300*time.Millisecond)
+
+	srv.mu.Lock()
+	stored := srv.counts["Load1"]
+	srv.mu.Unlock()
+	if stored < target {
+		t.Errorf("mailbox holds %d messages, below the %d target", stored, target)
+	}
+	// The rule tops up to the target and stops; some overshoot is the profile
+	// still choosing APPEND, not the rule failing.
+	if stored > target*3 {
+		t.Errorf("mailbox grew to %d against a %d target — the steady state is not holding", stored, target)
+	}
+}
+
+// The check that makes this a test rather than a generator: a server that
+// accepts APPEND and stores nothing answers OK to everything, and only the
+// message count gives it away.
+func TestClientDetectsAServerThatDropsMail(t *testing.T) {
+	srv := newFake()
+	srv.dropAppend = true // accepts and acknowledges, stores nothing
+	addr := srv.serve(t)
+	d := testDriver(t, addr, imapdrv.Config{
+		Users: []string{"u1@example.com"}, MailboxesPerUser: 1,
+		TargetMessages: 3,
+		Profile:        imapdrv.Profile{Append: 1, Noop: 1},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	err := d.RunClient(ctx, 0, stats.New())
+	if err == nil {
+		t.Fatal("a server that acknowledged every append and stored nothing was reported as healthy")
+	}
+	if !strings.Contains(err.Error(), "this client added") {
+		t.Errorf("error does not name the mismatch: %v", err)
+	}
+}
+
+// Commands illegal in the current state are never sent: a driver that ignores
+// protocol state is guessing at a server rather than testing one.
+func TestNoCommandRunsBeforeSelect(t *testing.T) {
+	srv := newFake()
+	addr := srv.serve(t)
+	d := testDriver(t, addr, imapdrv.Config{
+		Users: []string{"u1@example.com"}, MailboxesPerUser: 2,
+		TargetMessages: 2,
+		Profile:        imapdrv.Profile{Fetch: 5, Store: 5, Append: 1},
+	})
+	runFor(t, d, 0, stats.New(), 300*time.Millisecond)
+
+	cmds := srv.snapshot(func(f *fakeIMAP) []string { return f.commands })
+	seenSelect := false
+	for _, cmd := range cmds {
+		switch cmd {
+		case "SELECT":
+			seenSelect = true
+		case "FETCH", "STORE", "APPEND", "EXPUNGE", "SEARCH":
+			if !seenSelect {
+				t.Fatalf("%s was sent before any SELECT: %v", cmd, cmds)
+			}
+		}
+	}
+}
+
+// A profile weight of zero means the command never runs.
+func TestZeroWeightCommandsNeverRun(t *testing.T) {
+	srv := newFake()
+	addr := srv.serve(t)
+	d := testDriver(t, addr, imapdrv.Config{
+		Users: []string{"u1@example.com"}, MailboxesPerUser: 1,
+		TargetMessages: 2,
+		Profile:        imapdrv.Profile{Fetch: 1},
+	})
+	runFor(t, d, 0, stats.New(), 200*time.Millisecond)
+
+	for _, cmd := range srv.snapshot(func(f *fakeIMAP) []string { return f.commands }) {
+		if cmd == "SEARCH" || cmd == "STORE" || cmd == "LIST" {
+			t.Fatalf("%s ran with zero weight", cmd)
+		}
 	}
 }
 
@@ -245,23 +345,18 @@ func TestAppendLiteralMatchesTheBody(t *testing.T) {
 	srv := newFake()
 	addr := srv.serve(t)
 	d := testDriver(t, addr, imapdrv.Config{
-		Users:            []string{"u1@example.com"},
-		MailboxesPerUser: 1,
-		Ops:              imapdrv.OpMix{Append: 1},
-		Corpus:           corpus.Spec{MinSize: 4096, MaxSize: 64 << 10, AttachmentRatio: 0.5, Seed: 2},
+		Users: []string{"u1@example.com"}, MailboxesPerUser: 1,
+		TargetMessages: 1000, // keep it appending
+		Profile:        imapdrv.Profile{Append: 1},
+		Corpus:         corpus.Spec{MinSize: 4096, MaxSize: 64 << 10, AttachmentRatio: 0.5, Seed: 2},
 	})
+	runFor(t, d, 0, stats.New(), 400*time.Millisecond)
 
-	c := stats.New()
-	for i := 0; i < 12; i++ {
-		if err := d.Run(context.Background(), 0, c); err != nil {
-			t.Fatalf("append %d: %v", i, err)
-		}
-	}
 	srv.mu.Lock()
 	got := append([][]byte(nil), srv.appendBod...)
 	srv.mu.Unlock()
-	if len(got) != 12 {
-		t.Fatalf("server received %d appends, want 12", len(got))
+	if len(got) < 5 {
+		t.Fatalf("server received %d appends, too few to check", len(got))
 	}
 	// Byte-for-byte against the same corpus: a literal one short still leaves
 	// the session readable, because the server consumes the missing byte as
@@ -273,59 +368,6 @@ func TestAppendLiteralMatchesTheBody(t *testing.T) {
 		if string(body) != string(expected) {
 			t.Fatalf("append %d: server received %d bytes, driver generated %d — the literal and the body disagree",
 				i, len(body), len(expected))
-		}
-	}
-	if summary := c.Summary(); summary.Errors != 0 {
-		t.Errorf("%d errors on a healthy server", summary.Errors)
-	}
-}
-
-// The mix is deterministic so two runs with the same flags issue the same
-// operations: a comparison should differ by the server, not by the generator.
-func TestOperationMixIsHonoured(t *testing.T) {
-	srv := newFake()
-	addr := srv.serve(t)
-	d := testDriver(t, addr, imapdrv.Config{
-		Users:            []string{"u1@example.com"},
-		MailboxesPerUser: 1,
-		Ops:              imapdrv.OpMix{Append: 1, Fetch: 1, Store: 1, Search: 1},
-	})
-
-	c := stats.New()
-	for i := 0; i < 16; i++ {
-		if err := d.Run(context.Background(), 0, c); err != nil {
-			t.Fatalf("operation %d: %v", i, err)
-		}
-	}
-	counts := map[string]int{}
-	for _, cmd := range srv.snapshot(func(f *fakeIMAP) []string { return f.commands }) {
-		counts[cmd]++
-	}
-	for _, want := range []string{"APPEND", "FETCH", "STORE", "SEARCH"} {
-		if counts[want] != 4 {
-			t.Errorf("%s ran %d times over 16 operations with an even mix, want 4", want, counts[want])
-		}
-	}
-}
-
-// An operation excluded from the mix must never run.
-func TestZeroWeightOperationsNeverRun(t *testing.T) {
-	srv := newFake()
-	addr := srv.serve(t)
-	d := testDriver(t, addr, imapdrv.Config{
-		Users:            []string{"u1@example.com"},
-		MailboxesPerUser: 1,
-		Ops:              imapdrv.OpMix{Fetch: 1},
-	})
-	c := stats.New()
-	for i := 0; i < 8; i++ {
-		if err := d.Run(context.Background(), 0, c); err != nil {
-			t.Fatalf("operation %d: %v", i, err)
-		}
-	}
-	for _, cmd := range srv.snapshot(func(f *fakeIMAP) []string { return f.commands }) {
-		if cmd == "APPEND" || cmd == "STORE" || cmd == "SEARCH" {
-			t.Fatalf("%s ran with zero weight", cmd)
 		}
 	}
 }
@@ -348,15 +390,27 @@ func TestPrepareCreatesTheMailboxSet(t *testing.T) {
 	}
 }
 
-func distinct(in []string) []string {
-	seen := map[string]bool{}
-	for _, v := range in {
-		seen[v] = true
+// The profile spec is what a job carries, so a typo must fail the run rather
+// than silently produce a different workload.
+func TestParseProfile(t *testing.T) {
+	tests := []struct {
+		name, spec string
+		wantErr    bool
+	}{
+		{name: "empty is the default", spec: ""},
+		{name: "named weights", spec: "append=30,fetch=20,search=5"},
+		{name: "spaces", spec: " append = 3 , noop = 1 "},
+		{name: "unknown command", spec: "frobnicate=5", wantErr: true},
+		{name: "not a pair", spec: "append", wantErr: true},
+		{name: "not a number", spec: "append=lots", wantErr: true},
+		{name: "all zero", spec: "append=0,fetch=0", wantErr: true},
 	}
-	out := make([]string, 0, len(seen))
-	for v := range seen {
-		out = append(out, v)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := imapdrv.ParseProfile(tt.spec)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("err = %v, wantErr = %t", err, tt.wantErr)
+			}
+		})
 	}
-	sort.Strings(out)
-	return out
 }

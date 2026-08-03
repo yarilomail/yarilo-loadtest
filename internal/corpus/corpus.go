@@ -41,6 +41,11 @@ type Spec struct {
 // cheaper than delivering it.
 type Generator struct {
 	spec Spec
+	// base is the Date header's starting point. With a seed it is fixed, so a
+	// seeded corpus is byte-for-byte reproducible: a Date taken from the clock
+	// made two runs with one seed differ in content while matching in length,
+	// which is the kind of difference a comparison silently absorbs.
+	base time.Time
 
 	mu  sync.Mutex
 	rnd *rand.Rand
@@ -58,7 +63,17 @@ func New(spec Spec) *Generator {
 	if seed == 0 {
 		seed = time.Now().UnixNano()
 	}
-	return &Generator{spec: spec, rnd: rand.New(rand.NewSource(seed))} //nolint:gosec // corpus shape, not secrecy
+	base := time.Now()
+	if spec.Seed != 0 {
+		// A fixed point, not the clock: the seed's promise is that two runs
+		// generate the same mail.
+		base = time.Date(2020, time.January, 1, 0, 0, 0, 0, time.UTC)
+	}
+	return &Generator{
+		spec: spec,
+		base: base,
+		rnd:  rand.New(rand.NewSource(seed)), //nolint:gosec // corpus shape, not secrecy
+	}
 }
 
 // Next renders one message as RFC 5322 bytes with CRLF line endings, which is
@@ -82,7 +97,7 @@ func (g *Generator) Generate(from, to string) []byte {
 	fmt.Fprintf(&b, "To: %s\r\n", to)
 	fmt.Fprintf(&b, "Subject: loadtest message %d\r\n", seq)
 	fmt.Fprintf(&b, "Message-Id: <lt-%d-%d@yarilo-loadtest>\r\n", msgID, seq)
-	fmt.Fprintf(&b, "Date: %s\r\n", time.Now().Format(time.RFC1123Z))
+	fmt.Fprintf(&b, "Date: %s\r\n", g.base.Add(time.Duration(seq)*time.Second).Format(time.RFC1123Z))
 	b.WriteString("MIME-Version: 1.0\r\n")
 
 	if !withAttachment {
