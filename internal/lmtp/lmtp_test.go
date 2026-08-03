@@ -296,3 +296,42 @@ func TestDeliverReportsARefusal(t *testing.T) {
 		t.Error("the refusal was not counted as an error")
 	}
 }
+
+// The handshake and the transfer are separate observations. Recording both as
+// "DATA" counted every delivery twice and put two unrelated things in one
+// histogram: the 354 reply takes microseconds, the transfer hundreds of
+// milliseconds, so the median described neither and a failure could not be
+// attributed to either.
+func TestDeliveryRecordsHandshakeAndBodySeparately(t *testing.T) {
+	srv := &fakeLMTP{}
+	addr := srv.serve(t)
+
+	d := lmtp.New(lmtp.Config{
+		Addr:       addr,
+		Recipients: []string{"u1@example.com"},
+		Corpus:     corpus.Spec{MinSize: 1024, MaxSize: 1024, Seed: 11},
+		Timeout:    5 * time.Second,
+	})
+	c := stats.New()
+	const deliveries = 5
+	for i := 0; i < deliveries; i++ {
+		if err := d.Deliver(context.Background(), 0, c); err != nil {
+			t.Fatalf("delivery %d: %v", i, err)
+		}
+	}
+
+	cmds := c.Summary().Commands
+	// One of each per delivery: the count of DATA must match the count of the
+	// commands that surround it, or ops/s for deliveries is inflated.
+	for _, name := range []string{"MAIL", "RCPT", "DATA", "BODY"} {
+		if cmds[name].Count != deliveries {
+			t.Errorf("%s counted %d times over %d deliveries", name, cmds[name].Count, deliveries)
+		}
+	}
+	// And they are not the same measurement: the transfer is orders of
+	// magnitude slower than the reply that precedes it.
+	if cmds["BODY"].MedianMs < cmds["DATA"].MedianMs {
+		t.Errorf("BODY median %.3fms is below DATA median %.3fms — the two are still conflated",
+			cmds["BODY"].MedianMs, cmds["DATA"].MedianMs)
+	}
+}

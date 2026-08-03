@@ -22,9 +22,14 @@ type Live struct {
 	mu    sync.Mutex
 	prev  map[string]int
 	prevE map[string]int
-	// columns is fixed after the first line so the table stays readable: a
-	// column order that changes as commands first appear cannot be scanned.
+	// columns grows as commands first appear. It used to be frozen at the
+	// first line, for readability — which silently dropped every command that
+	// had not run yet, and with it their errors: the table reported zero errors
+	// through a run whose summary reported eight, and the tool contradicted
+	// itself. A new column is appended and the header reprinted, which is the
+	// price of the table being true.
 	columns []string
+	known   map[string]bool
 	rows    int
 }
 
@@ -33,17 +38,20 @@ func NewLive(c *Collector, w io.Writer, interval time.Duration) *Live {
 		interval = time.Second
 	}
 	return &Live{c: c, w: w, interval: interval,
-		prev: map[string]int{}, prevE: map[string]int{}}
+		prev: map[string]int{}, prevE: map[string]int{}, known: map[string]bool{}}
 }
 
-// Run prints until ctx is done. It is not the summary: the summary reports the
-// whole run, this reports each interval.
+// Run prints until done is closed. It is not the summary: the summary reports
+// the whole run, this reports each interval.
 func (l *Live) Run(done <-chan struct{}) {
 	t := time.NewTicker(l.interval)
 	defer t.Stop()
 	for {
 		select {
 		case <-done:
+			// One last line, or everything after the final tick is invisible —
+			// including a run that failed in its closing second.
+			l.tick()
 			return
 		case <-t.C:
 			l.tick()
@@ -56,24 +64,37 @@ func (l *Live) tick() {
 	defer l.mu.Unlock()
 
 	s := l.c.Summary()
-	if l.columns == nil {
-		names := make([]string, 0, len(s.Commands))
-		for name := range s.Commands {
-			names = append(names, name)
+	if len(s.Commands) == 0 {
+		return
+	}
+
+	// Errors are summed over everything the collector has seen, not over the
+	// printed columns: a command that appears late must not take its failures
+	// with it.
+	var errs int
+	for name, cur := range s.Commands {
+		errs += cur.Errors - l.prevE[name]
+		l.prevE[name] = cur.Errors
+	}
+
+	fresh := false
+	for name := range s.Commands {
+		if !l.known[name] {
+			l.known[name] = true
+			l.columns = append(l.columns, name)
+			fresh = true
 		}
-		sort.Strings(names)
-		l.columns = names
+	}
+	if fresh {
+		sort.Strings(l.columns)
 		l.header()
 	}
 
 	fmt.Fprintf(l.w, "%6.0fs", s.DurationSeconds)
-	var errs int
 	for _, name := range l.columns {
 		cur := s.Commands[name]
 		delta := cur.Count - l.prev[name]
 		l.prev[name] = cur.Count
-		errs += cur.Errors - l.prevE[name]
-		l.prevE[name] = cur.Errors
 		fmt.Fprintf(l.w, " %7d", delta)
 	}
 	fmt.Fprintf(l.w, " %7d\n", errs)

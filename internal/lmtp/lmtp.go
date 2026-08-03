@@ -107,10 +107,17 @@ func (d *Driver) Deliver(ctx context.Context, _ int, c *stats.Collector) error {
 	msg := d.gen.Generate(d.cfg.Sender, rcpts[0])
 	t0 = time.Now()
 	err = s.body(msg, len(rcpts))
-	// One DATA yields one reply per recipient (RFC 2033), so the timing is
-	// attributed to the whole delivery rather than divided by a fan-out the
-	// server did not parallelise.
-	c.Observe("DATA", time.Since(t0), err)
+	// BODY, not DATA. Both used to be recorded under one name, which counted
+	// every delivery twice and — worse — put two unrelated observations in one
+	// histogram: the 354 handshake takes microseconds, the transfer takes
+	// hundreds of milliseconds, so the result was bimodal by construction and
+	// its median described neither. A failure was equally unattributable: the
+	// server refusing DATA and the transfer failing looked the same.
+	//
+	// One DATA yields one reply per recipient (RFC 2033), so this covers the
+	// whole delivery rather than being divided by a fan-out the server did not
+	// parallelise.
+	c.Observe("BODY", time.Since(t0), err)
 	if err != nil {
 		return err
 	}

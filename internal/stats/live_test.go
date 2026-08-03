@@ -122,3 +122,61 @@ func atoi(s string) int {
 	}
 	return n
 }
+
+// A command that first runs after the table has started must appear, and its
+// errors must be counted from the moment they happen. Freezing the columns on
+// the first line dropped both: a run whose summary reported eight errors showed
+// zero in every interval, and the tool contradicted itself.
+func TestLiveCountsCommandsThatAppearLate(t *testing.T) {
+	c := stats.New()
+	var out buf
+	live := stats.NewLive(c, &out, 30*time.Millisecond)
+	done := make(chan struct{})
+	go live.Run(done)
+
+	c.Observe("CONNECT", time.Millisecond, nil)
+	time.Sleep(70 * time.Millisecond)
+
+	// A command the first line never saw, failing.
+	c.Observe("BODY", time.Millisecond, errFake{})
+	time.Sleep(70 * time.Millisecond)
+	close(done)
+	time.Sleep(30 * time.Millisecond)
+
+	text := out.String()
+	if !strings.Contains(text, "BODY") {
+		t.Errorf("a command that appeared after the first line is missing from the table:\n%s", text)
+	}
+	// The column set must include what appeared late; freezing it after the
+	// first line is the defect, and it hid the errors entirely rather than
+	// delaying them.
+	var errs int
+	for _, line := range nonEmpty(text) {
+		fields := strings.Fields(line)
+		if len(fields) == 0 || !strings.HasSuffix(fields[0], "s") {
+			continue
+		}
+		errs += atoi(fields[len(fields)-1])
+	}
+	if errs != 1 {
+		t.Errorf("intervals report %d errors, want 1 — the table disagrees with the run:\n%s", errs, text)
+	}
+}
+
+// Whatever happens after the last tick still gets printed: a run that fails in
+// its closing second would otherwise leave no trace in the table.
+func TestLivePrintsAFinalLine(t *testing.T) {
+	c := stats.New()
+	var out buf
+	live := stats.NewLive(c, &out, time.Hour) // no tick will ever fire
+	done := make(chan struct{})
+	go live.Run(done)
+
+	c.Observe("APPEND", time.Millisecond, errFake{})
+	close(done)
+	time.Sleep(50 * time.Millisecond)
+
+	if !strings.Contains(out.String(), "APPEND") {
+		t.Errorf("nothing was printed for the final interval:\n%s", out.String())
+	}
+}
