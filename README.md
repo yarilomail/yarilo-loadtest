@@ -83,6 +83,10 @@ mailboxes grow all the way through a run, so the same operation costs more at
 the end than at the start and no two measurements are comparable — with each
 other or with a later run.
 
+`-msgs 0` turns the steady state off, which is what a read-only run needs: a
+`-profile search=100` run that has to append a hundred messages first is
+measuring the path it was written to exclude.
+
 **Commands respect protocol state.** FETCH before SELECT is never sent; a
 generator that ignores state is guessing at a server rather than testing one.
 
@@ -196,7 +200,7 @@ Kubernetes Job fails without anything parsing the output.
 | `-users` | — | IMAP users, list or `user@domain:N` |
 | `-password` | — | password for every user |
 | `-tls` / `-insecure` | false | implicit TLS; skip certificate verification |
-| `-msgs` | 100 | messages each client keeps its mailbox near |
+| `-msgs` | 100 | messages each client keeps its mailbox near; `0` disables the steady state for read-only runs |
 | `-profile` | — | command weights, e.g. `append=30,fetch=20` |
 | `-mailboxes` | — | explicit per-user mailbox names |
 | `-mailboxes-per-user` | 0 | generate `Load1 … LoadN` instead of a list |
