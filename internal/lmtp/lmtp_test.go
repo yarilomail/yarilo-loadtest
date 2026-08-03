@@ -22,6 +22,11 @@ import (
 type fakeLMTP struct {
 	mu         sync.Mutex
 	deliveries []delivery
+	// bodyDelay is held before the post-transfer replies, standing in for the
+	// work a real server does there — write the message, update the index, run
+	// the full-text pass. Without it the fake answers in microseconds and the
+	// transfer cannot be distinguished from the handshake by timing at all.
+	bodyDelay time.Duration
 }
 
 type delivery struct {
@@ -90,7 +95,9 @@ func (f *fakeLMTP) handle(conn net.Conn) {
 			d.body = body.String()
 			f.mu.Lock()
 			f.deliveries = append(f.deliveries, d)
+			delay := f.bodyDelay
 			f.mu.Unlock()
+			time.Sleep(delay)
 			// One reply per recipient, per RFC 2033.
 			for range d.recipients {
 				w("250 2.0.0 delivered\r\n")
@@ -303,7 +310,12 @@ func TestDeliverReportsARefusal(t *testing.T) {
 // milliseconds, so the median described neither and a failure could not be
 // attributed to either.
 func TestDeliveryRecordsHandshakeAndBodySeparately(t *testing.T) {
-	srv := &fakeLMTP{}
+	// The delay is what makes this deterministic. Against a fake that answers
+	// instantly, both observations are microseconds and their order is noise —
+	// the assertion below failed about one run in ten while claiming to be
+	// about conflation, which is a test that reports a defect it did not find.
+	const serverWork = 20 * time.Millisecond
+	srv := &fakeLMTP{bodyDelay: serverWork}
 	addr := srv.serve(t)
 
 	d := lmtp.New(lmtp.Config{
@@ -328,10 +340,16 @@ func TestDeliveryRecordsHandshakeAndBodySeparately(t *testing.T) {
 			t.Errorf("%s counted %d times over %d deliveries", name, cmds[name].Count, deliveries)
 		}
 	}
-	// And they are not the same measurement: the transfer is orders of
-	// magnitude slower than the reply that precedes it.
-	if cmds["BODY"].MedianMs < cmds["DATA"].MedianMs {
-		t.Errorf("BODY median %.3fms is below DATA median %.3fms — the two are still conflated",
-			cmds["BODY"].MedianMs, cmds["DATA"].MedianMs)
+	// And they are not the same measurement. The server's work lands entirely
+	// in BODY: DATA is the 354 that precedes it, so a driver that timed them
+	// together would put this delay in both.
+	const ms = float64(serverWork / time.Millisecond)
+	if cmds["BODY"].MedianMs < ms {
+		t.Errorf("BODY median %.1fms is below the %.0fms the server spent — the transfer is not being measured",
+			cmds["BODY"].MedianMs, ms)
+	}
+	if cmds["DATA"].MedianMs >= ms {
+		t.Errorf("DATA median %.1fms includes the %.0fms of server work — the handshake and the transfer are still conflated",
+			cmds["DATA"].MedianMs, ms)
 	}
 }
