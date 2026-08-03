@@ -33,16 +33,28 @@ jobs:
       - uses: actions/setup-go@v6.0.0
         with:
           go-version: "1.26.2"
+          cache-dependency-path: go.mod
+
+      ## The linter is the expensive part of this job: installing it compiles
+      ## its whole dependency tree, which took longer than everything else here
+      ## put together. Cached on its pinned version, so it is built once and
+      ## restored after that; a version bump misses the key and rebuilds, which
+      ## is exactly when a rebuild is warranted.
+      - name: Cache golangci-lint
+        id: lint-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/go/bin/golangci-lint
+          key: golangci-lint-v1.64.8-go1.26.2-${{ runner.os }}
 
       ## Pinned to the version the server repo uses. A floating install means a
       ## green PR can go red on merge without a code change.
       - name: Install golangci-lint
-        run: |
-          want=v1.64.8
-          have=$(golangci-lint version 2>/dev/null | grep -oE 'version v?[0-9.]+' | grep -oE '[0-9.]+' || true)
-          if [ "v${have}" != "$want" ]; then
-            go install github.com/golangci/golangci-lint/cmd/golangci-lint@$want
-          fi
+        if: steps.lint-cache.outputs.cache-hit != 'true'
+        run: go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.64.8
+
+      - name: Add GOPATH bin to PATH
+        run: echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: Run golangci-lint
         run: golangci-lint run ./...
@@ -60,6 +72,7 @@ jobs:
       - uses: actions/setup-go@v6.0.0
         with:
           go-version: "1.26.2"
+          cache-dependency-path: go.mod
 
       ## -race because this is a concurrency tool. A data race here would show
       ## up as noise in the numbers it produces, which is the one failure mode
