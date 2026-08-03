@@ -51,10 +51,9 @@ var (
 	flagMailboxes  = flag.String("mailboxes", "", "comma-separated mailbox names per user")
 	flagMailboxesN = flag.Int("mailboxes-per-user", 0, "generate Load1..LoadN mailboxes per user instead of a list")
 	flagCreate     = flag.Bool("create-mailboxes", true, "create the mailbox set before the run")
-	flagOpAppend   = flag.Int("op-append", 3, "APPEND weight in the operation mix")
-	flagOpFetch    = flag.Int("op-fetch", 3, "FETCH weight")
-	flagOpStore    = flag.Int("op-store", 2, "STORE weight")
-	flagOpSearch   = flag.Int("op-search", 2, "SEARCH weight")
+	flagMsgs       = flag.Int("msgs", 100, "message count each client keeps its mailbox near")
+	flagProfileStr = flag.String("profile", "",
+		"command weights, e.g. 'append=30,fetch=30,store=15,search=5'; empty uses the default mix")
 
 	flagJSON = flag.Bool("json", false, "emit the summary as JSON instead of a table")
 )
@@ -143,6 +142,10 @@ func runIMAP(ctx context.Context, c *stats.Collector) error {
 	if len(users) == 0 {
 		fail("-users is required for the imap driver")
 	}
+	profile, perr := imapdrv.ParseProfile(*flagProfileStr)
+	if perr != nil {
+		fail("%v", perr)
+	}
 	d, err := imapdrv.New(imapdrv.Config{
 		Addr:             *flagAddr,
 		Users:            users,
@@ -153,12 +156,8 @@ func runIMAP(ctx context.Context, c *stats.Collector) error {
 		Mailboxes:        splitList(*flagMailboxes),
 		MailboxesPerUser: *flagMailboxesN,
 		CreateMailboxes:  *flagCreate,
-		Ops: imapdrv.OpMix{
-			Append: *flagOpAppend,
-			Fetch:  *flagOpFetch,
-			Store:  *flagOpStore,
-			Search: *flagOpSearch,
-		},
+		TargetMessages:   *flagMsgs,
+		Profile:          profile,
 		Corpus: corpus.Spec{
 			MinSize:         *flagMinSize,
 			MaxSize:         *flagMaxSize,
@@ -171,7 +170,7 @@ func runIMAP(ctx context.Context, c *stats.Collector) error {
 	}
 	slog.Info("loadtest: starting", "protocol", "imap", "addr", *flagAddr,
 		"users", len(users), "mailboxes_per_user", len(d.Mailboxes()),
-		"concurrency", *flagConcurrency, "tls", *flagTLS)
+		"clients", *flagConcurrency, "target_messages", *flagMsgs, "tls", *flagTLS)
 
 	// Mailbox creation happens before the clock starts: a run whose first
 	// operations are CREATE measures setup, not steady state.
@@ -185,7 +184,7 @@ func runIMAP(ctx context.Context, c *stats.Collector) error {
 		Iterations:  *flagIterations,
 		RampUp:      *flagRampUp,
 		StopOnError: *flagStopOnError,
-	}, c, d.Run)
+	}, c, d.RunClient)
 }
 
 func splitList(s string) []string {

@@ -52,8 +52,9 @@ controls how many deliveries are in flight and nothing about which mailboxes
 they reach: a run with 150 recipients touches 150 mailboxes whether it uses 4
 clients or 40.
 
-With `-seed`, one seed produces one corpus: the same set of messages, though
-which client sends which is decided by scheduling. A before/after comparison
+With `-seed`, one seed produces one corpus byte for byte — including the `Date`
+header, which is derived from the seed rather than the clock. Which client sends
+which message is still decided by scheduling. A before/after comparison
 therefore compares the same mail, not the same order.
 
 A run is bounded by `-duration` or `-iterations`. Setting neither is refused:
@@ -65,25 +66,45 @@ an unbounded load run against a shared environment is somebody else's outage.
 yarilo-loadtest -protocol imap \
   -addr yarilo-imap:143 \
   -users 'u@d00001.test:150' -password secret \
+  -concurrency 500 -msgs 5000 -duration 90s \
   -mailboxes-per-user 10 \
-  -concurrency 20 -duration 5m \
-  -op-append 3 -op-fetch 3 -op-store 2 -op-search 2
+  -profile 'append=30,fetch=30,fetch2=10,store=15,search=5,expunge=5,logout=2'
 ```
 
-The **mailbox set is the point**. A generator that works only in INBOX cannot
-produce the condition worth testing against a server that dispatches index work
-per user: several mailboxes of one user wanting indexing at once. Either name
-them (`-mailboxes=INBOX,Archive,Work`) or generate them
-(`-mailboxes-per-user=10` → `Load1 … Load10`), and they are created before the
-clock starts so the run measures operations rather than setup.
+**Clients are persistent sessions.** A client logs in once and issues commands
+over the same connection until the run ends or the profile chooses LOGOUT. That
+is not tidiness: IMAP spends its resources per session — the index handle, the
+cached mailbox view, hibernation — and a generator that reconnects per operation
+measures the login path instead of any of them.
 
-User and mailbox are chosen **per operation**, like the LMTP recipient.
-`-concurrency` controls how many operations are in flight and nothing about
-where they land.
+**`-msgs` is a steady state, not a total.** Each client keeps its mailbox near
+that many messages, appending below it and expunging above. Without it the
+mailboxes grow all the way through a run, so the same operation costs more at
+the end than at the start and no two measurements are comparable — with each
+other or with a later run.
 
-The mix is deterministic: with even weights, 16 operations are 4 of each. Two
-runs with the same flags issue the same operations, so a comparison differs by
-the server rather than by the generator.
+**Commands respect protocol state.** FETCH before SELECT is never sent; a
+generator that ignores state is guessing at a server rather than testing one.
+
+**The client tracks what it believes the mailbox holds**, and compares it
+against the server's `EXISTS` whenever the server reports one. A server that
+acknowledges every APPEND and stores nothing answers `OK` to everything — only
+the count gives it away. The comparison is a floor, since these mailboxes are
+shared: more messages than expected is unremarkable, fewer cannot be explained
+by another client.
+
+**The mailbox set is configurable** — named (`-mailboxes=INBOX,Archive,Work`) or
+generated (`-mailboxes-per-user=10` → `Load1 … Load10`), created before the
+clock starts. A generator confined to INBOX cannot produce the condition worth
+testing against a server that dispatches index work per user: several mailboxes
+of one user wanting work at once.
+
+**The profile weights commands** the same way the reference tool does, over the
+same set: `list`, `status`, `select`, `fetch`, `fetch2`, `store`, `delete`,
+`expunge`, `search`, `noop`, `append`, `logout`. `fetch` is metadata, `fetch2`
+whole bodies. Weights are relative, so one can be changed without rebalancing
+the rest, and selection is deterministic: two runs with one profile issue the
+same proportions, so a comparison differs by the server rather than by chance.
 
 ### Output
 
@@ -124,10 +145,11 @@ Kubernetes Job fails without anything parsing the output.
 | `-users` | — | IMAP users, list or `user@domain:N` |
 | `-password` | — | password for every user |
 | `-tls` / `-insecure` | false | implicit TLS; skip certificate verification |
+| `-msgs` | 100 | messages each client keeps its mailbox near |
+| `-profile` | — | command weights, e.g. `append=30,fetch=20` |
 | `-mailboxes` | — | explicit per-user mailbox names |
 | `-mailboxes-per-user` | 0 | generate `Load1 … LoadN` instead of a list |
 | `-create-mailboxes` | true | create the set before the run |
-| `-op-append` / `-op-fetch` / `-op-store` / `-op-search` | 3/3/2/2 | operation mix weights |
 | `-json` | false | machine-readable summary |
 
 Ramp-up is not cosmetic: starting hundreds of connections in the same
