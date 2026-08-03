@@ -19,12 +19,13 @@ import (
 
 	"github.com/yarilomail/yarilo-loadtest/internal/corpus"
 	"github.com/yarilomail/yarilo-loadtest/internal/driver"
+	"github.com/yarilomail/yarilo-loadtest/internal/imapdrv"
 	"github.com/yarilomail/yarilo-loadtest/internal/lmtp"
 	"github.com/yarilomail/yarilo-loadtest/internal/stats"
 )
 
 var (
-	flagProtocol = flag.String("protocol", "", "protocol driver: lmtp")
+	flagProtocol = flag.String("protocol", "", "protocol driver: lmtp | imap")
 	flagAddr     = flag.String("addr", "", "host:port of the target listener")
 
 	flagConcurrency = flag.Int("concurrency", 10, "concurrent clients")
@@ -42,6 +43,18 @@ var (
 	flagMaxSize    = flag.Int("max-size", 8192, "largest generated message, bytes")
 	flagAttachRate = flag.Float64("attachment-ratio", 0, "fraction of messages carrying a base64 attachment, 0..1")
 	flagSeed       = flag.Int64("seed", 0, "corpus seed; the same seed generates the same mail")
+
+	flagUsers      = flag.String("users", "", "comma-separated IMAP users, or user@domain:N to expand u1..uN")
+	flagPassword   = flag.String("password", "", "password for every user")
+	flagTLS        = flag.Bool("tls", false, "connect with implicit TLS (IMAPS)")
+	flagInsecure   = flag.Bool("insecure", false, "skip TLS certificate verification")
+	flagMailboxes  = flag.String("mailboxes", "", "comma-separated mailbox names per user")
+	flagMailboxesN = flag.Int("mailboxes-per-user", 0, "generate Load1..LoadN mailboxes per user instead of a list")
+	flagCreate     = flag.Bool("create-mailboxes", true, "create the mailbox set before the run")
+	flagOpAppend   = flag.Int("op-append", 3, "APPEND weight in the operation mix")
+	flagOpFetch    = flag.Int("op-fetch", 3, "FETCH weight")
+	flagOpStore    = flag.Int("op-store", 2, "STORE weight")
+	flagOpSearch   = flag.Int("op-search", 2, "SEARCH weight")
 
 	flagJSON = flag.Bool("json", false, "emit the summary as JSON instead of a table")
 )
@@ -64,8 +77,10 @@ func main() {
 	switch strings.ToLower(*flagProtocol) {
 	case "lmtp":
 		err = runLMTP(ctx, c)
+	case "imap":
+		err = runIMAP(ctx, c)
 	case "":
-		fail("-protocol is required (lmtp)")
+		fail("-protocol is required (lmtp | imap)")
 	default:
 		fail("unknown protocol %q", *flagProtocol)
 	}
@@ -121,6 +136,66 @@ func runLMTP(ctx context.Context, c *stats.Collector) error {
 	}, c, func(ctx context.Context, id int, c *stats.Collector) error {
 		return d.Deliver(ctx, id, c)
 	})
+}
+
+func runIMAP(ctx context.Context, c *stats.Collector) error {
+	users := expandRecipients(*flagUsers)
+	if len(users) == 0 {
+		fail("-users is required for the imap driver")
+	}
+	d, err := imapdrv.New(imapdrv.Config{
+		Addr:             *flagAddr,
+		Users:            users,
+		Password:         *flagPassword,
+		TLS:              *flagTLS,
+		Insecure:         *flagInsecure,
+		Timeout:          *flagTimeout,
+		Mailboxes:        splitList(*flagMailboxes),
+		MailboxesPerUser: *flagMailboxesN,
+		CreateMailboxes:  *flagCreate,
+		Ops: imapdrv.OpMix{
+			Append: *flagOpAppend,
+			Fetch:  *flagOpFetch,
+			Store:  *flagOpStore,
+			Search: *flagOpSearch,
+		},
+		Corpus: corpus.Spec{
+			MinSize:         *flagMinSize,
+			MaxSize:         *flagMaxSize,
+			AttachmentRatio: *flagAttachRate,
+			Seed:            *flagSeed,
+		},
+	})
+	if err != nil {
+		fail("%v", err)
+	}
+	slog.Info("loadtest: starting", "protocol", "imap", "addr", *flagAddr,
+		"users", len(users), "mailboxes_per_user", len(d.Mailboxes()),
+		"concurrency", *flagConcurrency, "tls", *flagTLS)
+
+	// Mailbox creation happens before the clock starts: a run whose first
+	// operations are CREATE measures setup, not steady state.
+	if err := d.Prepare(ctx); err != nil {
+		return err
+	}
+	return driver.Run(ctx, driver.Options{
+		Addr:        *flagAddr,
+		Concurrency: *flagConcurrency,
+		Duration:    *flagDuration,
+		Iterations:  *flagIterations,
+		RampUp:      *flagRampUp,
+		StopOnError: *flagStopOnError,
+	}, c, d.Run)
+}
+
+func splitList(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // expandRecipients accepts an explicit list or the "u@domain:N" shorthand that
