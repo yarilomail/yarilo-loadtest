@@ -1,5 +1,7 @@
 # yarilo-loadtest
 
+[![CI](https://github.com/yarilomail/yarilo-loadtest/actions/workflows/ci.yml/badge.svg)](https://github.com/yarilomail/yarilo-loadtest/actions/workflows/ci.yml) [![Trivy](https://github.com/yarilomail/yarilo-loadtest/actions/workflows/trivy.yml/badge.svg)](https://github.com/yarilomail/yarilo-loadtest/actions/workflows/trivy.yml) [![Go 1.26](https://img.shields.io/badge/Go-1.26-00ADD8?logo=go&logoColor=white)](https://go.dev/) [![Platform](https://img.shields.io/badge/platform-linux%2Famd64-blue)](https://github.com/yarilomail/yarilo-loadtest) [![License: AGPL v3](https://img.shields.io/badge/license-AGPLv3-blue.svg)](LICENSE) ![Status: alpha](https://img.shields.io/badge/status-alpha-red)
+
 Load generator for [yarilo](https://github.com/yarilomail/yarilo): protocol
 drivers with per-command latency statistics.
 
@@ -88,6 +90,16 @@ Kubernetes Job fails without anything parsing the output.
 
 Ramp-up is not cosmetic: starting hundreds of connections in the same
 millisecond measures the accept queue rather than the server.
+
+## Releases
+
+`VERSION` is the release trigger, the part `helm/Chart.yaml` `appVersion` plays
+in the server repo. Bump it in the same PR as the change it ships, and merging
+produces a git tag, a GitHub release with generated notes, and a semver image
+tag. Leave it alone and main is built and pushed as `latest` plus the commit
+sha, with no release.
+
+Images: `ghcr.io/yarilomail/yarilo-loadtest` and `docker.io/0kaba0/yarilo-loadtest`.
 
 ## Licence
 

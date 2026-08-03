@@ -2,60 +2,175 @@ name: CI — yarilo-loadtest
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
   pull_request:
-    branches: [main]
+    branches:
+      - main
 
+## Cancel superseded runs on the same ref. PR pushes supersede each other, so an
+## in-flight run for an older commit is wasted work. Runs on main are never
+## cancelled: build/push and the release it triggers must complete.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+## No paths filter, unlike the server repo. Everything here is either the tool
+## or its build, so there is no class of change that legitimately skips CI — and
+## a filter would mean required status checks could never report on some PRs.
 env:
   REGISTRY: ghcr.io
-  IMAGE: ghcr.io/yarilomail/yarilo-loadtest
+  IMAGE: ghcr.io/${{ github.repository_owner }}/yarilo-loadtest
+  DOCKERHUB_IMAGE: docker.io/0kaba0/yarilo-loadtest
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   GOTOOLCHAIN: local
 
 jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@v7.0.1
+
+      - uses: actions/setup-go@v6.0.0
         with:
           go-version: "1.26.2"
+
+      ## Pinned to the version the server repo uses. A floating install means a
+      ## green PR can go red on merge without a code change.
       - name: Install golangci-lint
-        run: go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.64.8
-      - run: golangci-lint run ./...
-      - uses: hadolint/hadolint-action@v3.4.0
+        run: |
+          want=v1.64.8
+          have=$(golangci-lint version 2>/dev/null | grep -oE 'version v?[0-9.]+' | grep -oE '[0-9.]+' || true)
+          if [ "v${have}" != "$want" ]; then
+            go install github.com/golangci/golangci-lint/cmd/golangci-lint@$want
+          fi
+
+      - name: Run golangci-lint
+        run: golangci-lint run ./...
+
+      - name: Hadolint
+        uses: hadolint/hadolint-action@v3.4.0
         with:
           dockerfile: Dockerfile
 
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@v7.0.1
+
+      - uses: actions/setup-go@v6.0.0
         with:
           go-version: "1.26.2"
-      - run: go test -race ./...
+
+      ## -race because this is a concurrency tool. A data race here would show
+      ## up as noise in the numbers it produces, which is the one failure mode
+      ## nobody would trace back to the generator.
+      - name: Run tests
+        run: go test -race ./...
 
   build:
     needs: [lint, test]
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       packages: write
     steps:
-      - uses: actions/checkout@v5
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: actions/checkout@v7.0.1
         with:
-          registry: ${{ env.REGISTRY }}
+          fetch-depth: 0
+
+      ## VERSION plays the part helm/Chart.yaml appVersion plays in the server
+      ## repo: one file is the release trigger. Bump it and a git tag, a GitHub
+      ## release and a semver image tag follow; leave it and main is built
+      ## without any of them.
+      - name: Determine release version
+        id: version
+        run: |
+          APP_VERSION=$(tr -d ' \n' < VERSION)
+          RELEASE_TAG="v${APP_VERSION}"
+          if git ls-remote --tags origin "refs/tags/${RELEASE_TAG}" | grep -q "${RELEASE_TAG}"; then
+            IS_RELEASE=false
+          else
+            IS_RELEASE=true
+          fi
+          echo "tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "image_tag=${APP_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "is_release=${IS_RELEASE}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4.2.0
+        with:
+          driver: docker
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4.6.0
+        with:
+          registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v6
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4.6.0
+        with:
+          registry: docker.io
+          username: 0kaba0
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v6.2.0
+        with:
+          images: |
+            ${{ env.IMAGE }}
+            ${{ env.DOCKERHUB_IMAGE }}
+          tags: |
+            type=sha,prefix=,format=short
+            type=raw,value=latest
+            type=raw,value=${{ steps.version.outputs.image_tag }},enable=${{ steps.version.outputs.is_release == 'true' }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v7.3.0
         with:
           context: .
-          platforms: linux/amd64
+          file: Dockerfile
           push: true
-          build-args: BUILD_VERSION=${{ github.sha }}
-          tags: |
-            ${{ env.IMAGE }}:${{ github.sha }}
-            ${{ env.IMAGE }}:latest
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILD_VERSION=${{ steps.version.outputs.image_tag }}
+
+      - name: Generate release notes
+        if: steps.version.outputs.is_release == 'true'
+        uses: orhun/git-cliff-action@v4
+        id: cliff
+        with:
+          config: cliff.toml
+          args: --unreleased --strip header
+        env:
+          OUTPUT: RELEASE_NOTES.md
+
+      - name: Push git tag
+        if: steps.version.outputs.is_release == 'true'
+        run: |
+          git tag "${{ steps.version.outputs.tag }}"
+          git push origin "${{ steps.version.outputs.tag }}"
+
+      - name: Create GitHub Release
+        if: steps.version.outputs.is_release == 'true'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
+          body_path: RELEASE_NOTES.md
+
+      - name: Cleanup old GHCR versions
+        uses: actions/delete-package-versions@v5
+        with:
+          package-name: yarilo-loadtest
+          package-type: container
+          min-versions-to-keep: 10
+          delete-only-untagged-versions: true
