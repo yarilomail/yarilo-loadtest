@@ -5,6 +5,7 @@ package lmtp
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"net"
@@ -147,6 +148,51 @@ func (d *Driver) nextRecipients() []string {
 	return out
 }
 
+// stuffDots escapes the lines a message may not send as they are: RFC 5321
+// §4.5.2 reserves a line holding a single dot as the end of the data, so any
+// body line beginning with one is sent with an extra dot and the server removes
+// it again.
+//
+// The generated corpus never produces such a line, which is why this was left
+// out and why nothing noticed. A replayed message can contain anything — and
+// one containing a bare dot did not merely arrive corrupted: it ended the
+// transfer early, and everything after it was read as commands. That is why the
+// failure showed up as a refusal on a later command rather than on the body
+// (#20).
+func stuffDots(msg []byte) []byte {
+	if !needsStuffing(msg) {
+		return msg
+	}
+	out := make([]byte, 0, len(msg)+16)
+	atLineStart := true
+	for i := 0; i < len(msg); i++ {
+		if atLineStart && msg[i] == '.' {
+			out = append(out, '.')
+		}
+		out = append(out, msg[i])
+		atLineStart = msg[i] == '\n'
+	}
+	return out
+}
+
+// terminator ends the data, adding the CRLF the message lacks.
+func terminator(msg []byte) []byte {
+	if bytes.HasSuffix(msg, []byte("\r\n")) {
+		return []byte(".\r\n")
+	}
+	return []byte("\r\n.\r\n")
+}
+
+// needsStuffing keeps the common case allocation-free: almost no message has a
+// line starting with a dot, and copying every body to discover that would put
+// an allocation the size of the corpus in the hot path.
+func needsStuffing(msg []byte) bool {
+	if len(msg) > 0 && msg[0] == '.' {
+		return true
+	}
+	return bytes.Contains(msg, []byte("\n."))
+}
+
 type session struct {
 	conn net.Conn
 	br   *bufio.Reader
@@ -202,13 +248,15 @@ func (s *session) readReply(wantPrefix string) error {
 
 // body writes the message and reads one reply per recipient.
 func (s *session) body(msg []byte, recipients int) error {
-	if _, err := s.conn.Write(msg); err != nil {
+	if _, err := s.conn.Write(stuffDots(msg)); err != nil {
 		return fmt.Errorf("lmtp: write body: %w", err)
 	}
-	// Dot-stuffing is unnecessary for generated mail — the corpus never emits
-	// a line starting with a dot — but the terminator must be on its own line
-	// even when the body already ended with CRLF.
-	if _, err := s.conn.Write([]byte("\r\n.\r\n")); err != nil {
+	// The terminator is a line of its own, so it needs a CRLF before it only
+	// when the message does not already end with one. Writing both
+	// unconditionally appends an empty line to every message — which delivers
+	// fine and quietly makes the stored message differ from the one that was
+	// replayed, defeating the purpose of replaying it.
+	if _, err := s.conn.Write(terminator(msg)); err != nil {
 		return fmt.Errorf("lmtp: write terminator: %w", err)
 	}
 	for i := 0; i < recipients; i++ {
