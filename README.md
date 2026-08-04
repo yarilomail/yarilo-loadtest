@@ -231,6 +231,18 @@ RCPT                 2410        0         0      40.2      0.21      0.44      
 ran for 120.0s, 0 errors, 8 cancelled at the deadline
 ```
 
+Under a failing row the run prints one verbatim failure:
+
+```
+BODY                 4323     4323         0      36.0      0.14      0.93 …
+  first error: lmtp: got "554 5.0.0 transaction failed: smtp: too long a line in input stream", want 250
+```
+
+One example, not all of them: a run's failures are almost always one cause
+repeated, and the count beside it says whether that holds. A count without an
+example sends the reader to the server logs, which may have nothing to say —
+a tool used to diagnose has to be diagnosable itself.
+
 `errors` means the server did something wrong. `cancel` counts the operations
 the run cut off when `-duration` expired — one per client that was mid-command
 at the time, so a clean run has roughly `-concurrency` of them and **zero**
