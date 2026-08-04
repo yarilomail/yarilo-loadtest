@@ -21,11 +21,12 @@ import (
 	"github.com/yarilomail/yarilo-loadtest/internal/driver"
 	"github.com/yarilomail/yarilo-loadtest/internal/imapdrv"
 	"github.com/yarilomail/yarilo-loadtest/internal/lmtp"
+	"github.com/yarilomail/yarilo-loadtest/internal/pop3drv"
 	"github.com/yarilomail/yarilo-loadtest/internal/stats"
 )
 
 var (
-	flagProtocol = flag.String("protocol", "", "protocol driver: lmtp | imap")
+	flagProtocol = flag.String("protocol", "", "protocol driver: lmtp | imap | pop3")
 	flagAddr     = flag.String("addr", "", "host:port of the target listener")
 
 	flagConcurrency = flag.Int("concurrency", 10, "concurrent clients")
@@ -54,6 +55,10 @@ var (
 	flagMsgs       = flag.Int("msgs", 100, "message count each client keeps its mailbox near")
 	flagProfileStr = flag.String("profile", "",
 		"command weights, e.g. 'append=30,fetch=30,store=15,search=5'; empty uses the default mix")
+
+	flagRetr = flag.Int("retr", 10, "messages one POP3 session retrieves; 0 surveys without retrieving")
+	flagDele = flag.Bool("delete", false, "POP3: delete what was retrieved — consumes the corpus")
+	flagUIDL = flag.Bool("uidl", false, "POP3: ask for the unique-id listing as a keep-mail-on-server client does")
 
 	flagMbox     = flag.String("mbox", "", "replay messages from this mbox file instead of generating them")
 	flagInterval = flag.Duration("interval", time.Second, "how often to print the live table; 0 disables it")
@@ -93,8 +98,10 @@ func main() {
 		err = runLMTP(ctx, c, src)
 	case "imap":
 		err = runIMAP(ctx, c, src)
+	case "pop3":
+		err = runPOP3(ctx, c)
 	case "":
-		fail("-protocol is required (lmtp | imap)")
+		fail("-protocol is required (lmtp | imap | pop3)")
 	default:
 		fail("unknown protocol %q", *flagProtocol)
 	}
@@ -152,6 +159,46 @@ func runLMTP(ctx context.Context, c *stats.Collector, src corpus.Source) error {
 	}, c, func(ctx context.Context, id int, c *stats.Collector) error {
 		return d.Deliver(ctx, id, c)
 	})
+}
+
+// runPOP3 drives full POP3 sessions: connect, authenticate, survey, retrieve,
+// quit. A session per iteration rather than the persistent connections the IMAP
+// driver holds — a POP3 server locks the maildrop for the length of a session,
+// so a generator that stayed connected would measure its own lock contention.
+func runPOP3(ctx context.Context, c *stats.Collector) error {
+	users := expandRecipients(*flagUsers)
+	if len(users) == 0 {
+		fail("-users is required for the pop3 driver")
+	}
+	d, err := pop3drv.New(pop3drv.Config{
+		Addr:               *flagAddr,
+		Users:              users,
+		Password:           *flagPassword,
+		TLS:                *flagTLS,
+		Insecure:           *flagInsecure,
+		Timeout:            *flagTimeout,
+		MessagesPerSession: *flagRetr,
+		Delete:             *flagDele,
+		UIDL:               *flagUIDL,
+	})
+	if err != nil {
+		fail("%v", err)
+	}
+	slog.Info("loadtest: starting", "protocol", "pop3", "addr", *flagAddr,
+		"users", len(users), "concurrency", *flagConcurrency,
+		"retr_per_session", *flagRetr, "delete", *flagDele)
+	if *flagDele {
+		slog.Warn("loadtest: -delete is on — this run consumes the mailboxes it reads")
+	}
+
+	return driver.Run(ctx, driver.Options{
+		Addr:        *flagAddr,
+		Concurrency: *flagConcurrency,
+		Duration:    *flagDuration,
+		Iterations:  *flagIterations,
+		RampUp:      *flagRampUp,
+		StopOnError: *flagStopOnError,
+	}, c, d.Session)
 }
 
 // messageSource picks the corpus: a replayed mbox when one is given, generated

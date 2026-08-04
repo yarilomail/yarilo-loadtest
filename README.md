@@ -28,7 +28,7 @@ so a before/after comparison compares one thing.
 |:---|:---|
 | LMTP | implemented — delivery storm, configurable sizes and fan-out |
 | IMAP | implemented — APPEND/FETCH/STORE/SEARCH over a configurable mailbox set |
-| POP3 | planned |
+| POP3 | implemented — full sessions, bounded retrieval, optional DELE |
 | JMAP | planned |
 
 ## Usage
@@ -124,6 +124,37 @@ comparing two runs means comparing the same work, and the same corpus is the
 only way to be sure of that. Line endings are normalised to CRLF and the mbox
 `>From ` escaping is undone, so a replayed message is the one that was stored.
 
+### POP3
+
+```sh
+yarilo-loadtest -protocol pop3 \
+  -addr yarilo-pop3-login:110 \
+  -users u1@d00001.test:150 -password 'secret' \
+  -concurrency 16 -duration 3m -retr 10
+```
+
+**A session per iteration, not a persistent connection.** That is a protocol
+difference rather than a shortcut: a POP3 server locks the maildrop for the
+length of a session (RFC 1939 §3), so a client that stays connected keeps every
+other client for that user locked out. A generator that held its sessions open
+would measure its own lock contention and report it as the server's.
+
+Each session is the whole sequence — connect, `USER`, `PASS`, `STAT`, `LIST`,
+optionally `UIDL`, then `RETR` up to `-retr` messages, newest first, and `QUIT`.
+Every command is timed on its own, because `RETR` and `QUIT` in one bucket give
+a median that describes neither.
+
+**`-retr` is bounded**, for the same reason the IMAP driver bounds its fetch
+window: an unbounded `RETR` loop walks the whole maildrop, so its cost grows
+with the mailbox and the same operation is cheap at the start of a run and
+expensive at the end. `-retr 0` surveys without retrieving.
+
+**`-delete` is off by default and consumes the corpus when on.** It issues
+`DELE` for what it retrieved, so the maildrop is expunged at `QUIT` — which is
+the point if you are measuring that path, and destroys the mailboxes every
+other run measures against if you are not. The run logs a warning when it is
+enabled.
+
 ### Live output
 
 A line per interval on stderr while the run is going, with a column per command
@@ -200,6 +231,9 @@ Kubernetes Job fails without anything parsing the output.
 | `-users` | — | IMAP users, list or `user@domain:N` |
 | `-password` | — | password for every user |
 | `-tls` / `-insecure` | false | implicit TLS; skip certificate verification |
+| `-retr` | 10 | POP3: messages one session retrieves; `0` surveys without retrieving |
+| `-delete` | false | POP3: `DELE` what was retrieved — consumes the corpus |
+| `-uidl` | false | POP3: ask for the unique-id listing |
 | `-msgs` | 100 | messages each client keeps its mailbox near; `0` disables the steady state for read-only runs |
 | `-profile` | — | command weights, e.g. `append=30,fetch=20` |
 | `-mailboxes` | — | explicit per-user mailbox names |
