@@ -104,3 +104,62 @@ func TestMboxIsSafeForConcurrentUse(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// A corpus with an over-long line cannot be delivered at all: the server
+// rejects the whole transaction, so every delivery fails and the reason it
+// gives — "too long a line in input stream" — names neither the message nor the
+// line nor the length. That is a defect in this loader as much as in the file:
+// the file is known here, and a run that cannot succeed should not start.
+func TestLoadMboxRejectsAnOverLongLine(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "long.mbox")
+
+	long := strings.Repeat("x", corpus.MaxLineOctets) // + CRLF puts it over
+	body := "From sender Mon Jan  1 00:00:00 2020\n" +
+		"From: a@example.com\n" +
+		"Subject: fine\n" +
+		"\n" +
+		"short line\n" +
+		"From sender Mon Jan  1 00:01:00 2020\n" +
+		"From: a@example.com\n" +
+		"Subject: not fine\n" +
+		"\n" +
+		"short line\n" +
+		long + "\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := corpus.LoadMbox(path)
+	if err == nil {
+		t.Fatal("a corpus that no server will accept was loaded without complaint")
+	}
+	// The point of the check is the detail: a reader has to be able to find
+	// the line without bisecting the file.
+	for _, want := range []string{"message 2", "line 5", "octets"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the error does not name %s: %v", want, err)
+		}
+	}
+}
+
+// A line exactly at the limit is legal and must load: an off-by-one here would
+// reject corpora that work.
+func TestLoadMboxAcceptsALineAtTheLimit(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "edge.mbox")
+
+	// MaxLineOctets includes the CRLF, so the text may be two shorter.
+	atLimit := strings.Repeat("y", corpus.MaxLineOctets-2)
+	body := "From sender Mon Jan  1 00:00:00 2020\n" +
+		"From: a@example.com\n" +
+		"\n" +
+		atLimit + "\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := corpus.LoadMbox(path); err != nil {
+		t.Errorf("a line of exactly %d octets was rejected: %v", corpus.MaxLineOctets, err)
+	}
+}
