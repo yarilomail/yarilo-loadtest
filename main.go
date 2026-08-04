@@ -20,13 +20,14 @@ import (
 	"github.com/yarilomail/yarilo-loadtest/internal/corpus"
 	"github.com/yarilomail/yarilo-loadtest/internal/driver"
 	"github.com/yarilomail/yarilo-loadtest/internal/imapdrv"
+	"github.com/yarilomail/yarilo-loadtest/internal/jmapdrv"
 	"github.com/yarilomail/yarilo-loadtest/internal/lmtp"
 	"github.com/yarilomail/yarilo-loadtest/internal/pop3drv"
 	"github.com/yarilomail/yarilo-loadtest/internal/stats"
 )
 
 var (
-	flagProtocol = flag.String("protocol", "", "protocol driver: lmtp | imap | pop3")
+	flagProtocol = flag.String("protocol", "", "protocol driver: lmtp | imap | pop3 | jmap")
 	flagAddr     = flag.String("addr", "", "host:port of the target listener")
 
 	flagConcurrency = flag.Int("concurrency", 10, "concurrent clients")
@@ -59,6 +60,10 @@ var (
 	flagRetr = flag.Int("retr", 10, "messages one POP3 session retrieves; 0 surveys without retrieving")
 	flagDele = flag.Bool("delete", false, "POP3: delete what was retrieved — consumes the corpus")
 	flagUIDL = flag.Bool("uidl", false, "POP3: ask for the unique-id listing as a keep-mail-on-server client does")
+
+	flagWindow  = flag.Int("window", 20, "JMAP: messages one Email/query returns")
+	flagBodies  = flag.Bool("bodies", false, "JMAP: ask Email/get for body values, not metadata alone")
+	flagThreads = flag.Bool("threads", false, "JMAP: also Thread/get the threads the query returned")
 
 	flagMbox     = flag.String("mbox", "", "replay messages from this mbox file instead of generating them")
 	flagInterval = flag.Duration("interval", time.Second, "how often to print the live table; 0 disables it")
@@ -100,8 +105,10 @@ func main() {
 		err = runIMAP(ctx, c, src)
 	case "pop3":
 		err = runPOP3(ctx, c)
+	case "jmap":
+		err = runJMAP(ctx, c)
 	case "":
-		fail("-protocol is required (lmtp | imap | pop3)")
+		fail("-protocol is required (lmtp | imap | pop3 | jmap)")
 	default:
 		fail("unknown protocol %q", *flagProtocol)
 	}
@@ -199,6 +206,61 @@ func runPOP3(ctx context.Context, c *stats.Collector) error {
 		RampUp:      *flagRampUp,
 		StopOnError: *flagStopOnError,
 	}, c, d.Session)
+}
+
+// runJMAP drives the request chain a mail client issues: session discovery
+// once, then Mailbox/get and a single request carrying Email/query and
+// Email/get joined by a back-reference.
+//
+// -addr is a base URL here rather than host:port, because JMAP is HTTP and the
+// API endpoint is read out of the session resource rather than assembled.
+func runJMAP(ctx context.Context, c *stats.Collector) error {
+	users := expandRecipients(*flagUsers)
+	if len(users) == 0 {
+		fail("-users is required for the jmap driver")
+	}
+	base := *flagAddr
+	if !strings.HasPrefix(base, "http://") && !strings.HasPrefix(base, "https://") {
+		scheme := "http://"
+		if *flagTLS {
+			scheme = "https://"
+		}
+		base = scheme + base
+	}
+	d, err := jmapdrv.New(jmapdrv.Config{
+		BaseURL:     base,
+		Users:       users,
+		Password:    *flagPassword,
+		Insecure:    *flagInsecure,
+		Timeout:     *flagTimeout,
+		Window:      *flagWindow,
+		FetchBodies: *flagBodies,
+		Threads:     *flagThreads,
+	})
+	if err != nil {
+		fail("%v", err)
+	}
+	slog.Info("loadtest: starting", "protocol", "jmap", "base_url", base,
+		"users", len(users), "concurrency", *flagConcurrency,
+		"window", *flagWindow, "bodies", *flagBodies, "threads", *flagThreads)
+
+	// One client per worker, built once: the session it discovers and the
+	// connection it keeps are what a JMAP client holds, and rebuilding either
+	// per iteration would measure discovery and TLS instead of mail.
+	clients := make([]*jmapdrv.Client, *flagConcurrency)
+	for i := range clients {
+		clients[i] = d.NewClient()
+	}
+	return driver.Run(ctx, driver.Options{
+		Addr:        base,
+		Concurrency: *flagConcurrency,
+		Duration:    *flagDuration,
+		Iterations:  *flagIterations,
+		RampUp:      *flagRampUp,
+		StopOnError: *flagStopOnError,
+	}, c, func(ctx context.Context, id int, c *stats.Collector) error {
+		return d.Iterate(ctx, clients[id%len(clients)], c)
+	})
 }
 
 // messageSource picks the corpus: a replayed mbox when one is given, generated

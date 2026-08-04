@@ -29,7 +29,7 @@ so a before/after comparison compares one thing.
 | LMTP | implemented — delivery storm, configurable sizes and fan-out |
 | IMAP | implemented — APPEND/FETCH/STORE/SEARCH over a configurable mailbox set |
 | POP3 | implemented — full sessions, bounded retrieval, optional DELE |
-| JMAP | planned |
+| JMAP | implemented — session discovery, Mailbox/get, chained Email/query+get |
 
 ## Usage
 
@@ -155,6 +155,39 @@ the point if you are measuring that path, and destroys the mailboxes every
 other run measures against if you are not. The run logs a warning when it is
 enabled.
 
+### JMAP
+
+```sh
+yarilo-loadtest -protocol jmap \
+  -addr https://mail.example.com \
+  -users u1@d00001.test:150 -password 'secret' \
+  -concurrency 16 -duration 3m -window 20 -bodies
+```
+
+`-addr` is a base URL here, not `host:port`: JMAP is HTTP, and **the API
+endpoint is read out of the session resource** rather than assembled. A driver
+that hard-codes `/jmap/api/` is testing its own guess and would keep passing
+against a server that moved it.
+
+**The session is fetched once per client.** It is what a real client discovers
+at startup and never repeats; re-fetching it per operation measures discovery.
+The HTTP connection is kept alive for the same reason — it is the only thing a
+JMAP client holds open, since credentials ride on every request instead.
+
+**`Email/query` and `Email/get` travel as one request**, joined by a
+back-reference (RFC 8620 §3.7): `#ids` tells the server to feed the query's
+result into the get without the client seeing it. Saving that round trip is what
+JMAP is for, so issuing them separately would measure a client nobody writes and
+report the server as slower than it is.
+
+**A method failure under HTTP 200 is an error.** JMAP answers 200 for a request
+whose methods all failed, so a driver that stops at the status code reports a
+server refusing everything as a healthy one.
+
+`-window` bounds the query, `-bodies` asks for body values rather than metadata
+alone — on the server, the difference between an index lookup and going to the
+message store — and `-threads` adds a `Thread/get` for what the query returned.
+
 ### Live output
 
 A line per interval on stderr while the run is going, with a column per command
@@ -231,6 +264,9 @@ Kubernetes Job fails without anything parsing the output.
 | `-users` | — | IMAP users, list or `user@domain:N` |
 | `-password` | — | password for every user |
 | `-tls` / `-insecure` | false | implicit TLS; skip certificate verification |
+| `-window` | 20 | JMAP: messages one `Email/query` returns |
+| `-bodies` | false | JMAP: fetch body values, not metadata alone |
+| `-threads` | false | JMAP: also `Thread/get` the returned threads |
 | `-retr` | 10 | POP3: messages one session retrieves; `0` surveys without retrieving |
 | `-delete` | false | POP3: `DELE` what was retrieved — consumes the corpus |
 | `-uidl` | false | POP3: ask for the unique-id listing |
