@@ -34,6 +34,11 @@ func TestDefaultsThatProtectTheCorpus(t *testing.T) {
 			why:  "an unbounded retrieval walks the whole maildrop, so its cost grows with the mailbox and no two measurements in one run are comparable",
 		},
 		{
+			flag: "window",
+			want: "20",
+			why:  "an unbounded JMAP query grows with the mailbox, like every other fetch here",
+		},
+		{
 			flag: "concurrency",
 			want: "10",
 			why:  "a default in the hundreds points a load test at a shared environment before anyone has chosen to",
@@ -69,9 +74,9 @@ func TestDefaultsThatProtectTheCorpus(t *testing.T) {
 // A guard over a list of names stops guarding the moment a name is wrong, and
 // says nothing while it does. Every entry above must resolve.
 func TestGuardedFlagsAllExist(t *testing.T) {
-	const guarded = 6
+	const guarded = 7
 	var found int
-	for _, name := range []string{"delete", "retr", "concurrency", "duration", "iterations", "stop-on-error"} {
+	for _, name := range []string{"delete", "retr", "window", "concurrency", "duration", "iterations", "stop-on-error"} {
 		if flag.Lookup(name) != nil {
 			found++
 		}
