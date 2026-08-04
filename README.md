@@ -124,6 +124,14 @@ comparing two runs means comparing the same work, and the same corpus is the
 only way to be sure of that. Line endings are normalised to CRLF and the mbox
 `>From ` escaping is undone, so a replayed message is the one that was stored.
 
+**The corpus is checked at load, not at delivery.** SMTP carries at most 1000
+octets per line including the CRLF (RFC 5321 §4.5.3.1.6), and a server given a
+longer one rejects the **whole transaction** — so one unwrapped line makes every
+delivery in the run fail, and the server says only "too long a line in input
+stream": no message number, no line number, no length. The loader refuses such a
+file and names all three. Real mail wraps; a corpus assembled by a script often
+does not.
+
 ### POP3
 
 ```sh
