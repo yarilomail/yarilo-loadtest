@@ -233,11 +233,13 @@ func TestDotStuffedBodyDoesNotEndTheMessageEarly(t *testing.T) {
 	}
 }
 
-// Deleting is off unless asked for. A load run that deletes empties the
-// mailboxes every other run measures against — the default has to be the safe
-// one, and it has to be checked, because nothing else would notice until a
-// later run reported an empty maildrop.
-func TestDeleteIsOffByDefault(t *testing.T) {
+// Deleting happens only when the config asks for it.
+//
+// Named for what it checks. It was TestDeleteIsOffByDefault, which promised
+// something it could not see: the default lives in main.go, so flipping it left
+// this green (#17). The default is guarded in main_test.go; this guards the
+// driver's half — that it obeys the config it is given.
+func TestDeleteObeysTheConfig(t *testing.T) {
 	srv := newFake()
 	addr := srv.serve(t)
 	d := testDriver(t, addr, pop3drv.Config{
