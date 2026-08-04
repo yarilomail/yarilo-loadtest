@@ -5,6 +5,8 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -90,7 +92,11 @@ func (f *fakeLMTP) handle(conn net.Conn) {
 				if bl == ".\r\n" {
 					break
 				}
-				body.WriteString(bl)
+				// A real server removes the escaping the client added, so the
+				// fake has to as well: otherwise a test comparing what arrived
+				// against what was sent would be comparing the wire form with
+				// the message and would call correct stuffing a corruption.
+				body.WriteString(strings.TrimPrefix(bl, "."))
 			}
 			d.body = body.String()
 			f.mu.Lock()
@@ -351,5 +357,75 @@ func TestDeliveryRecordsHandshakeAndBodySeparately(t *testing.T) {
 	if cmds["DATA"].MedianMs >= ms {
 		t.Errorf("DATA median %.1fms includes the %.0fms of server work — the handshake and the transfer are still conflated",
 			cmds["DATA"].MedianMs, ms)
+	}
+}
+
+// Replay has to put on the wire exactly what was loaded. The generated corpus
+// and a replayed one take the same path from DATA onwards, so a failure that
+// only appears with -mbox is a difference in the bytes — and nothing here
+// compared them until a replay run failed 100% of its deliveries (#20).
+func TestReplayedMessageArrivesByteForByte(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "corpus.mbox")
+
+	// Two messages, unix line endings, and the two shapes mbox has to undo:
+	// a body line that mbox escaped as ">From ", and a line that is a single
+	// dot, which the wire reserves as the terminator.
+	const file = "From sender Mon Jan  1 00:00:00 2020\n" +
+		"From: gen@es.test\n" +
+		"To: u1@d00001.test\n" +
+		"Subject: corpus es 0\n" +
+		"\n" +
+		"hola que tal\n" +
+		">From here it continues\n" +
+		".\n" +
+		"final line\n" +
+		"\n" +
+		"From sender Mon Jan  1 00:01:00 2020\n" +
+		"From: gen@es.test\n" +
+		"Subject: corpus es 1\n" +
+		"\n" +
+		"segundo mensaje\n"
+	if err := os.WriteFile(path, []byte(file), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	src, err := corpus.LoadMbox(path)
+	if err != nil {
+		t.Fatalf("LoadMbox: %v", err)
+	}
+	if src.Len() != 2 {
+		t.Fatalf("loaded %d messages, want 2", src.Len())
+	}
+
+	srv := &fakeLMTP{}
+	addr := srv.serve(t)
+	d := lmtp.New(lmtp.Config{
+		Addr:       addr,
+		Recipients: []string{"u1@example.com"},
+		Source:     src,
+		Timeout:    5 * time.Second,
+	})
+
+	c := stats.New()
+	for i := 0; i < 2; i++ {
+		if err := d.Deliver(context.Background(), 0, c); err != nil {
+			t.Fatalf("delivery %d: %v", i, err)
+		}
+	}
+	if got := c.Summary().Errors; got != 0 {
+		t.Fatalf("%d errors replaying a corpus the loader accepted", got)
+	}
+
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if len(srv.deliveries) != 2 {
+		t.Fatalf("server received %d messages, want 2", len(srv.deliveries))
+	}
+	for i, want := range [][]byte{src.Next(), src.Next()} {
+		got := srv.deliveries[i].body
+		if got != string(want) {
+			t.Errorf("message %d differs from what was loaded:\n got %q\nwant %q", i, got, string(want))
+		}
 	}
 }
