@@ -246,6 +246,25 @@ Kubernetes Job fails without anything parsing the output.
 Ramp-up is not cosmetic: starting hundreds of connections in the same
 millisecond measures the accept queue rather than the server.
 
+## Tests
+
+Every test here was written for a defect that had already happened, and five of
+them have since turned out to check something adjacent to the property their
+name promised. So:
+
+**Mutate the thing the name promises, not the thing the code does.** A test
+called `TestDeleteIsOffByDefault` must fail when the default is flipped — it is
+not enough that it fails when the driver ignores its config. Those are different
+claims, and the first is the one that keeps a load run from emptying a sandbox.
+
+Concretely, before a test is finished: reintroduce the defect and watch it fail.
+If it passes, the test is describing something else, however true that something
+is. The ones that caught real damage this way are marked in their comments.
+
+Flag defaults that are safety rather than preference — `-delete`, `-retr`,
+`-duration`, `-concurrency` — are guarded in `main_test.go`, because a
+driver-level test cannot see them.
+
 ## Releases
 
 `VERSION` is the release trigger, the part `helm/Chart.yaml` `appVersion` plays
