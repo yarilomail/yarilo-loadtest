@@ -32,6 +32,13 @@ type command struct {
 	// cancelled counts operations cut off when the run ended. They are not
 	// failures: the tool stopped, not the server.
 	cancelled int
+	// firstErr is the first failure this command saw, kept verbatim.
+	//
+	// One example, not all of them: a load run's failures are almost always one
+	// cause repeated, and the count beside it says whether that assumption
+	// holds. Keeping every error would grow with the failure rate, which is
+	// exactly when memory is least worth spending.
+	firstErr string
 
 	// samples holds every latency. A load run is bounded by duration or
 	// iterations, so this stays proportional to the work actually done —
@@ -85,6 +92,9 @@ func (c *Collector) Observe(name string, d time.Duration, err error) {
 		cmd.cancelled++
 	default:
 		cmd.errors++
+		if cmd.firstErr == "" {
+			cmd.firstErr = err.Error()
+		}
 	}
 }
 
@@ -101,15 +111,18 @@ type Summary struct {
 // CmdStat is one command's outcome. Percentiles rather than a mean alone: a
 // mean hides the tail, and the tail is what an operator notices.
 type CmdStat struct {
-	Count     int     `json:"count"`
-	Errors    int     `json:"errors"`
-	Cancelled int     `json:"cancelled"`
-	PerSecond float64 `json:"perSecond"`
-	MinMs     float64 `json:"minMs"`
-	MedianMs  float64 `json:"medianMs"`
-	P95Ms     float64 `json:"p95Ms"`
-	P99Ms     float64 `json:"p99Ms"`
-	MaxMs     float64 `json:"maxMs"`
+	Count     int `json:"count"`
+	Errors    int `json:"errors"`
+	Cancelled int `json:"cancelled"`
+	// FirstError is one verbatim failure, so a run explains itself instead of
+	// requiring a second one to find out what went wrong.
+	FirstError string  `json:"firstError,omitempty"`
+	PerSecond  float64 `json:"perSecond"`
+	MinMs      float64 `json:"minMs"`
+	MedianMs   float64 `json:"medianMs"`
+	P95Ms      float64 `json:"p95Ms"`
+	P99Ms      float64 `json:"p99Ms"`
+	MaxMs      float64 `json:"maxMs"`
 }
 
 func (c *Collector) Summary() Summary {
@@ -124,15 +137,16 @@ func (c *Collector) Summary() Summary {
 		sorted := append([]time.Duration(nil), cmd.samples...)
 		sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
 		out.Commands[name] = CmdStat{
-			Count:     len(sorted),
-			Errors:    cmd.errors,
-			Cancelled: cmd.cancelled,
-			PerSecond: float64(len(sorted)) / elapsed,
-			MinMs:     ms(percentile(sorted, 0)),
-			MedianMs:  ms(percentile(sorted, 0.50)),
-			P95Ms:     ms(percentile(sorted, 0.95)),
-			P99Ms:     ms(percentile(sorted, 0.99)),
-			MaxMs:     ms(percentile(sorted, 1)),
+			Count:      len(sorted),
+			Errors:     cmd.errors,
+			Cancelled:  cmd.cancelled,
+			FirstError: cmd.firstErr,
+			PerSecond:  float64(len(sorted)) / elapsed,
+			MinMs:      ms(percentile(sorted, 0)),
+			MedianMs:   ms(percentile(sorted, 0.50)),
+			P95Ms:      ms(percentile(sorted, 0.95)),
+			P99Ms:      ms(percentile(sorted, 0.99)),
+			MaxMs:      ms(percentile(sorted, 1)),
 		}
 		out.Errors += cmd.errors
 		out.Cancelled += cmd.cancelled
@@ -166,6 +180,12 @@ func (s Summary) WriteTable(w io.Writer) {
 		c := s.Commands[name]
 		fmt.Fprintf(w, "%-16s %8d %8d %9d %9.1f %9.2f %9.2f %9.2f %9.2f %9.2f\n",
 			name, c.Count, c.Errors, c.Cancelled, c.PerSecond, c.MinMs, c.MedianMs, c.P95Ms, c.P99Ms, c.MaxMs)
+		// The count says how much went wrong; this says what. Printed under the
+		// row it belongs to, because a failure explained somewhere else in the
+		// output is a failure the reader has to correlate.
+		if c.FirstError != "" {
+			fmt.Fprintf(w, "  first error: %s\n", c.FirstError)
+		}
 	}
 	fmt.Fprintf(w, "\nran for %.1fs, %d errors, %d cancelled at the deadline\n",
 		s.DurationSeconds, s.Errors, s.Cancelled)

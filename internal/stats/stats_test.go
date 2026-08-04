@@ -1,8 +1,10 @@
 package stats
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -43,5 +45,52 @@ func TestFailuresBeforeStoppingStillCount(t *testing.T) {
 	}
 	if s.Cancelled != 0 {
 		t.Errorf("cancelled = %d, want 0", s.Cancelled)
+	}
+}
+
+// A run that reports 4323 errors and no example sends the reader to the server
+// logs, which in the case that prompted this had nothing to say — the rejection
+// was per-transaction and never surfaced there. The information existed on the
+// first run and was thrown away (#22).
+func TestSummaryCarriesAVerbatimError(t *testing.T) {
+	c := New()
+	const first = `lmtp: got "554 5.0.0 transaction failed: smtp: too long a line in input stream", want 250`
+	c.Observe("BODY", time.Millisecond, errors.New(first))
+	c.Observe("BODY", time.Millisecond, errors.New("a later, different failure"))
+	c.Observe("BODY", time.Millisecond, nil)
+
+	s := c.Summary()
+	if got := s.Commands["BODY"].FirstError; got != first {
+		t.Errorf("FirstError = %q, want the first failure verbatim: %q", got, first)
+	}
+
+	var buf bytes.Buffer
+	s.WriteTable(&buf)
+	if !strings.Contains(buf.String(), "too long a line in input stream") {
+		t.Errorf("the table reports counts without the error text:\n%s", buf.String())
+	}
+	if !strings.Contains(buf.String(), "first error:") {
+		t.Error("the sample is not labelled, so a reader cannot tell what the line is")
+	}
+}
+
+// A clean run must stay clean: no error line, and nothing captured from the
+// operations the deadline cut off.
+func TestCleanRunReportsNoSampleError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	c := New()
+	c.BindRun(ctx)
+	c.Observe("BODY", time.Millisecond, nil)
+	cancel()
+	c.Observe("BODY", time.Millisecond, errors.New("context canceled"))
+
+	s := c.Summary()
+	if got := s.Commands["BODY"].FirstError; got != "" {
+		t.Errorf("a cancelled operation was reported as a sample failure: %q", got)
+	}
+	var buf bytes.Buffer
+	s.WriteTable(&buf)
+	if strings.Contains(buf.String(), "first error:") {
+		t.Errorf("a clean run printed an error line:\n%s", buf.String())
 	}
 }
