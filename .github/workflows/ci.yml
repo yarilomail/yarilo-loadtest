@@ -45,7 +45,7 @@ jobs:
       ## is exactly when a rebuild is warranted.
       - name: Cache golangci-lint
         id: lint-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/go/bin/golangci-lint
           key: golangci-lint-v1.64.8-go1.26.2-${{ runner.os }}
