@@ -35,6 +35,19 @@ func TestGoModAndDockerfileNameTheSameToolchain(t *testing.T) {
 	if !strings.Contains(dockerfile, "ENV GOTOOLCHAIN=local") {
 		t.Error("GOTOOLCHAIN is not local, so a newer go.mod fetches a toolchain instead of failing the build")
 	}
+
+	// And CI must take the version from go.mod rather than from a literal of
+	// its own. It did not: with GOTOOLCHAIN=local and a literal one patch
+	// behind, every job failed with "go.mod requires go >= 1.26.7 (running go
+	// 1.26.2)" -- a third place naming the toolchain is a third place to
+	// forget.
+	ci := readFile(t, filepath.Join(root, ".github", "workflows", "ci.yml"))
+	if strings.Contains(ci, "go-version:") {
+		t.Error("ci.yml pins a Go version of its own; it must use go-version-file: go.mod")
+	}
+	if !strings.Contains(ci, "go-version-file: go.mod") {
+		t.Error("ci.yml does not read the Go version from go.mod")
+	}
 }
 
 func readFile(t *testing.T, path string) string {
