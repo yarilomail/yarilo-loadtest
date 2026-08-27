@@ -229,9 +229,13 @@ else is driving and snapshots the servers the moment that run reports a stalled
 command.
 
 ```sh
-kubectl -n yarilo-sb apply -f hack/stall-watch.yaml
-kubectl -n yarilo-sb set env job/stall-watch TARGET=imaptest-mdbox
+sed 's/TARGET_JOB/imaptest-mdbox/' hack/stall-watch.yaml | kubectl -n yarilo-sb apply -f -
 ```
+
+The target goes in **before** the Job is created. A Job's `spec.template` is
+immutable, so `kubectl set env job/stall-watch …` is refused — edit the
+manifest, or pipe it through `sed` as above. To retarget a watch that is already
+running, delete it and apply again.
 
 It runs **inside the cluster**, reading the target run's log through the API
 server with its own read-only service account. That is not tidiness either: a

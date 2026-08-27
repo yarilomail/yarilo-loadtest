@@ -10,8 +10,10 @@
 # snapshot still arrives and the two profiles are simply absent -- which reads
 # as a quiet server rather than as a switch that is off, so check it first.
 #
-#   kubectl -n yarilo-sb apply -f hack/stall-watch.yaml
-#   kubectl -n yarilo-sb set env job/stall-watch TARGET=imaptest-<name>   # or edit below
+#   sed 's/TARGET_JOB/imaptest-<name>/' hack/stall-watch.yaml | kubectl -n yarilo-sb apply -f -
+#
+# The target goes in before the Job exists: spec.template is immutable, so
+# `kubectl set env job/...` is refused. Retargeting means delete and apply.
 #
 # The code is a mode of the load generator itself, so this pulls the image the
 # gate already pulls and adds nothing to the cluster.
@@ -85,8 +87,11 @@ spec:
         image: ghcr.io/yarilomail/yarilo-loadtest:latest
         args: ["stall-watch"]
         env:
+        # Replaced before apply -- see the header. Left as a placeholder rather
+        # than a real job name so an unedited manifest fails visibly instead of
+        # watching whatever ran last.
         - name: TARGET
-          value: imaptest-rw1
+          value: TARGET_JOB
         - name: NS
           value: yarilo-sb
         # One capture per minute: a burst of stalls must not bury the first.
