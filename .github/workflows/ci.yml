@@ -30,7 +30,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
 
-      - uses: actions/setup-go@v6.0.0
+      - uses: actions/setup-go@v7.0.0
         with:
           ## From go.mod, not a literal: a third place naming the toolchain
           ## is a third place to forget. The Dockerfile is the second, and a
@@ -72,7 +72,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
 
-      - uses: actions/setup-go@v6.0.0
+      - uses: actions/setup-go@v7.0.0
         with:
           ## From go.mod, not a literal: a third place naming the toolchain
           ## is a third place to forget. The Dockerfile is the second, and a
