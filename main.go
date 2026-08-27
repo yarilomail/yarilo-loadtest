@@ -82,7 +82,9 @@ func main() {
 		slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 			Level: levelFromEnv(),
 		})))
-		if err := stallwatch.Run(); err != nil {
+		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		defer stop()
+		if err := stallwatch.Run(ctx); err != nil {
 			fail("stall-watch: %v", err)
 		}
 		return

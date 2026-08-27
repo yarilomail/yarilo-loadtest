@@ -24,6 +24,7 @@ package stallwatch
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -65,13 +66,17 @@ type watcher struct {
 	plain *http.Client
 }
 
-// Run watches the target job and returns when its log ends.
-func Run() error {
+// Run watches the target job and returns when its log ends or ctx is done.
+//
+// The context is the whole point of taking one: the watch follows a log for the
+// length of a run, so a Job asked to stop has to be able to stop it -- without
+// it a SIGTERM waits out the grace period and the pod is killed mid-capture.
+func Run(ctx context.Context) error {
 	w, err := newWatcher()
 	if err != nil {
 		return err
 	}
-	return w.run()
+	return w.run(ctx)
 }
 
 func newWatcher() (*watcher, error) {
@@ -104,6 +109,8 @@ func newWatcher() (*watcher, error) {
 		api: &http.Client{Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12},
 		}},
+		// Per-request deadlines rather than a client-wide one: the CPU profile
+		// legitimately takes as long as it was asked to run for.
 		plain: &http.Client{},
 	}
 	w.pattern, err = regexp.Compile(env("PATTERN", `stalled (>3s|for \d+ secs)`))
@@ -139,8 +146,8 @@ func (w *watcher) logf(format string, args ...any) {
 }
 
 // apiGet returns the response body for a cluster API path. The caller closes it.
-func (w *watcher) apiGet(path string) (io.ReadCloser, error) {
-	req, err := http.NewRequest(http.MethodGet, apiServer+path, nil)
+func (w *watcher) apiGet(ctx context.Context, path string) (io.ReadCloser, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiServer+path, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -170,8 +177,8 @@ type podList struct {
 	} `json:"items"`
 }
 
-func (w *watcher) pods(query string) (*podList, error) {
-	body, err := w.apiGet("/api/v1/namespaces/" + w.ns + "/pods" + query)
+func (w *watcher) pods(ctx context.Context, query string) (*podList, error) {
+	body, err := w.apiGet(ctx, "/api/v1/namespaces/"+w.ns+"/pods"+query)
 	if err != nil {
 		return nil, err
 	}
@@ -183,8 +190,8 @@ func (w *watcher) pods(query string) (*podList, error) {
 	return &list, nil
 }
 
-func (w *watcher) backends() ([]backend, error) {
-	list, err := w.pods("")
+func (w *watcher) backends(ctx context.Context) ([]backend, error) {
+	list, err := w.pods(ctx, "")
 	if err != nil {
 		return nil, err
 	}
@@ -203,10 +210,10 @@ func (w *watcher) backends() ([]backend, error) {
 
 // targetPod waits for the run to be scheduled: the watch is usually started
 // before the job it watches.
-func (w *watcher) targetPod() (string, error) {
+func (w *watcher) targetPod(ctx context.Context) (string, error) {
 	deadline := time.Now().Add(10 * time.Minute)
 	for {
-		list, err := w.pods("?labelSelector=job-name%3D" + w.target)
+		list, err := w.pods(ctx, "?labelSelector=job-name%3D"+w.target)
 		if err != nil {
 			return "", err
 		}
@@ -218,16 +225,25 @@ func (w *watcher) targetPod() (string, error) {
 		if time.Now().After(deadline) {
 			return "", fmt.Errorf("the run %s never started", w.target)
 		}
-		time.Sleep(5 * time.Second)
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(5 * time.Second):
+		}
 	}
 }
 
 // save writes what url returns to path. A failed capture is logged and does not
 // end the watch: one missing file is worth less than the rest of the run.
-func (w *watcher) save(url, path string, timeout time.Duration) {
-	client := *w.plain
-	client.Timeout = timeout
-	resp, err := client.Get(url)
+func (w *watcher) save(ctx context.Context, url, path string, timeout time.Duration) {
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
+	if err != nil {
+		w.logf("  %s: %v", url, err)
+		return
+	}
+	resp, err := w.plain.Do(req)
 	if err != nil {
 		w.logf("  %s: %v", url, err)
 		return
@@ -264,26 +280,26 @@ func (w *watcher) cpuStat(uid, path string) {
 	}
 }
 
-func (w *watcher) capture(tag string, backends []backend) {
+func (w *watcher) capture(ctx context.Context, tag string, backends []backend) {
 	for _, b := range backends {
 		base := filepath.Join(w.out, tag+"-"+b.name)
-		w.save(fmt.Sprintf("http://%s:%s/debug/pprof/goroutine?debug=2", b.ip, w.telemetry),
+		w.save(ctx, fmt.Sprintf("http://%s:%s/debug/pprof/goroutine?debug=2", b.ip, w.telemetry),
 			base+"-goroutine.txt", time.Minute)
-		w.save(fmt.Sprintf("http://%s:%s/metrics", b.ip, w.telemetry), base+"-metrics.txt", time.Minute)
+		w.save(ctx, fmt.Sprintf("http://%s:%s/metrics", b.ip, w.telemetry), base+"-metrics.txt", time.Minute)
 		w.cpuStat(b.uid, base+"-cpu.stat")
 	}
 	first := backends[0]
-	w.save(fmt.Sprintf("http://%s:%s/debug/pprof/profile?seconds=%d", first.ip, w.telemetry, int(w.profile.Seconds())),
+	w.save(ctx, fmt.Sprintf("http://%s:%s/debug/pprof/profile?seconds=%d", first.ip, w.telemetry, int(w.profile.Seconds())),
 		filepath.Join(w.out, tag+"-"+first.name+"-cpu.pb.gz"), w.profile+30*time.Second)
 	w.logf("captured %s", tag)
 }
 
-func (w *watcher) run() error {
-	backends, err := w.backends()
+func (w *watcher) run(ctx context.Context) error {
+	backends, err := w.backends(ctx)
 	if err != nil {
 		return err
 	}
-	pod, err := w.targetPod()
+	pod, err := w.targetPod(ctx)
 	if err != nil {
 		return err
 	}
@@ -293,7 +309,7 @@ func (w *watcher) run() error {
 	}
 	w.logf("watching %s (pod %s), backends: %s", w.target, pod, strings.Join(names, ", "))
 
-	stream, err := w.apiGet(fmt.Sprintf("/api/v1/namespaces/%s/pods/%s/log?follow=true&sinceSeconds=3600", w.ns, pod))
+	stream, err := w.apiGet(ctx, fmt.Sprintf("/api/v1/namespaces/%s/pods/%s/log?follow=true&sinceSeconds=3600", w.ns, pod))
 	if err != nil {
 		return err
 	}
@@ -314,7 +330,7 @@ func (w *watcher) run() error {
 		}
 		last = time.Now()
 		w.logf("EVENT: %s", truncate(strings.TrimSpace(line), 200))
-		w.capture("s"+strconv.FormatInt(last.Unix(), 10), backends)
+		w.capture(ctx, "s"+strconv.FormatInt(last.Unix(), 10), backends)
 	}
 	w.logf("run ended; %d stall lines seen", hits)
 	return scanner.Err()
