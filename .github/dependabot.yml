@@ -1,0 +1,49 @@
+version: 2
+
+## Nothing moved these for months: the Go base floated on a minor tag and the
+## runtime base sat on alpine:3.23 while the product had already moved to 3.24.
+## Neither was a decision -- there was simply nothing here to open the pull
+## request (yarilo#1510 did the same for the product repository).
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: UTC
+    labels:
+      - dependencies
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: UTC
+    labels:
+      - dependencies
+    open-pull-requests-limit: 5
+
+  ## Both bases are pinned to an exact patch, so something has to move them.
+  ##
+  ## Patches only for golang: go.mod names the same version and dependabot
+  ## cannot move both, so a patch is mechanical while a minor is a language
+  ## release and a person's decision.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: UTC
+    ignore:
+      - dependency-name: golang
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor
+    labels:
+      - dependencies
+    open-pull-requests-limit: 5
