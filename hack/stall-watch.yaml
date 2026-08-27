@@ -1,0 +1,112 @@
+# Event-triggered capture for the stall in #1517, running inside the cluster.
+#
+# It watches an imaptest run's log through the API server and snapshots both
+# backends the moment a stalled command is reported. In the cluster rather than
+# on an operator's machine on purpose: a dropped link used to end the watch at
+# exactly the moment it mattered.
+#
+# Needs telemetry.pprof.enabled on the backends: the goroutine dump and the CPU
+# profile come from /debug/pprof on the telemetry port. Without it the metrics
+# snapshot still arrives and the two profiles are simply absent -- which reads
+# as a quiet server rather than as a switch that is off, so check it first.
+#
+#   kubectl -n yarilo-sb apply -f hack/stall-watch.yaml
+#   kubectl -n yarilo-sb set env job/stall-watch TARGET=imaptest-<name>   # or edit below
+#
+# The code is a mode of the load generator itself, so this pulls the image the
+# gate already pulls and adds nothing to the cluster.
+#
+# Captures land on the qa-captures volume, which outlives the pod; read them
+# with any pod that mounts it.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: stall-watch
+  namespace: yarilo-sb
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: stall-watch
+  namespace: yarilo-sb
+rules:
+# pods to find the run and the backend addresses, pods/log to follow the run.
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["pods/log"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: stall-watch
+  namespace: yarilo-sb
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: stall-watch
+subjects:
+- kind: ServiceAccount
+  name: stall-watch
+  namespace: yarilo-sb
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: qa-captures
+  namespace: yarilo-sb
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: stall-watch
+  namespace: yarilo-sb
+spec:
+  # No TTL: the captures are on the volume, but the log of what was seen is
+  # the pod's, and it is worth reading after the run.
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: stall-watch
+      containers:
+      - name: watch
+        ## latest on purpose, and the only place we deploy it: this is a
+        ## diagnostic started by hand beside a run, and it should be whatever
+        ## was built last rather than a tag somebody has to remember to bump.
+        ## Nothing in a gate depends on which build it is.
+        image: ghcr.io/yarilomail/yarilo-loadtest:latest
+        args: ["stall-watch"]
+        env:
+        - name: TARGET
+          value: imaptest-rw1
+        - name: NS
+          value: yarilo-sb
+        # One capture per minute: a burst of stalls must not bury the first.
+        - name: COOLDOWN
+          value: "60"
+        - name: PROFILE_SECS
+          value: "30"
+        volumeMounts:
+        - name: caps
+          mountPath: /caps
+        # Read-only, and optional in effect: without it the cgroup rows are
+        # skipped and every other capture still lands.
+        - name: cgroup
+          mountPath: /host/sys/fs/cgroup
+          readOnly: true
+        resources:
+          requests: {cpu: 20m, memory: 64Mi}
+          limits: {cpu: 200m, memory: 256Mi}
+      volumes:
+      - name: caps
+        persistentVolumeClaim: {claimName: qa-captures}
+      - name: cgroup
+        hostPath: {path: /sys/fs/cgroup, type: Directory}

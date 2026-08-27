@@ -24,6 +24,8 @@ import (
 	"github.com/yarilomail/yarilo-loadtest/internal/lmtp"
 	"github.com/yarilomail/yarilo-loadtest/internal/pop3drv"
 	"github.com/yarilomail/yarilo-loadtest/internal/stats"
+
+	"github.com/yarilomail/yarilo-loadtest/internal/stallwatch"
 )
 
 var (
@@ -72,6 +74,22 @@ var (
 )
 
 func main() {
+	// stall-watch is a mode rather than a protocol: it drives nothing and
+	// measures nothing, it watches a run somebody else is driving. Taken
+	// before flag.Parse so it does not have to satisfy the load flags -- it
+	// needs none of them, and -addr least of all.
+	if len(os.Args) > 1 && os.Args[1] == "stall-watch" {
+		slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+			Level: levelFromEnv(),
+		})))
+		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		defer stop()
+		if err := stallwatch.Run(ctx); err != nil {
+			fail("stall-watch: %v", err)
+		}
+		return
+	}
+
 	flag.Parse()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: levelFromEnv(),
