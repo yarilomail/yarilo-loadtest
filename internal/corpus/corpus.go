@@ -9,6 +9,7 @@ package corpus
 import (
 	"bytes"
 	"fmt"
+	"hash/fnv"
 	"math/rand"
 	"strings"
 	"sync"
@@ -85,6 +86,13 @@ func New(spec Spec) *Generator {
 
 // Next renders one message as RFC 5322 bytes with CRLF line endings, which is
 // what a delivery agent receives on the wire.
+//
+// The Message-ID carries the recipient. Without it the identity was the seed's
+// random draw and the sequence number, which repeats exactly across runs --
+// that is what the seed promises -- so seeding two ranges of mailboxes with one
+// seed gave every message a twin elsewhere: same id, different To. A client
+// that caches by Message-ID then sees one message change its envelope
+// (yarilo-loadtest#25).
 func (g *Generator) Generate(from, to string) []byte {
 	// Everything random is drawn under the lock; rendering happens outside it,
 	// since that is the part that costs anything.
@@ -103,7 +111,7 @@ func (g *Generator) Generate(from, to string) []byte {
 	fmt.Fprintf(&b, "From: %s\r\n", from)
 	fmt.Fprintf(&b, "To: %s\r\n", to)
 	fmt.Fprintf(&b, "Subject: loadtest message %d\r\n", seq)
-	fmt.Fprintf(&b, "Message-Id: <lt-%d-%d@yarilo-loadtest>\r\n", msgID, seq)
+	fmt.Fprintf(&b, "Message-Id: <lt-%d-%d-%s@yarilo-loadtest>\r\n", msgID, seq, recipientTag(to))
 	fmt.Fprintf(&b, "Date: %s\r\n", g.base.Add(time.Duration(seq)*time.Second).Format(time.RFC1123Z))
 	b.WriteString("MIME-Version: 1.0\r\n")
 
@@ -170,4 +178,17 @@ func writeBase64Filler(b *bytes.Buffer, n int) {
 		b.WriteString(line.String())
 		b.WriteString("\r\n")
 	}
+}
+
+// recipientTag is the recipient's share of a Message-ID: short, stable, and
+// derived from the address alone, so one seed and one recipient still render
+// byte-identical mail while two recipients never share an identifier.
+//
+// A hash rather than the address itself: an address contains characters a
+// msg-id cannot carry, and quoting them would make the identifier depend on
+// the escaping rules rather than on the recipient.
+func recipientTag(to string) string {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(to))
+	return fmt.Sprintf("%016x", h.Sum64())
 }
