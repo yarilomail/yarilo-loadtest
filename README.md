@@ -1,9 +1,10 @@
 # yarilo-loadtest
 
-[![CI](https://github.com/yarilomail/yarilo-loadtest/actions/workflows/ci.yml/badge.svg)](https://github.com/yarilomail/yarilo-loadtest/actions/workflows/ci.yml) [![Trivy](https://github.com/yarilomail/yarilo-loadtest/actions/workflows/trivy.yml/badge.svg)](https://github.com/yarilomail/yarilo-loadtest/actions/workflows/trivy.yml) [![Go 1.26](https://img.shields.io/badge/Go-1.26-00ADD8?logo=go&logoColor=white)](https://go.dev/) [![Platform](https://img.shields.io/badge/platform-linux%2Famd64-blue)](https://github.com/yarilomail/yarilo-loadtest) [![License: AGPL v3](https://img.shields.io/badge/license-AGPLv3-blue.svg)](LICENSE) ![Status: alpha](https://img.shields.io/badge/status-alpha-red)
+[![CI](https://github.com/yarilomail/yarilo-loadtest/actions/workflows/ci.yml/badge.svg)](https://github.com/yarilomail/yarilo-loadtest/actions/workflows/ci.yml) [![Trivy](https://github.com/yarilomail/yarilo-loadtest/actions/workflows/trivy.yml/badge.svg)](https://github.com/yarilomail/yarilo-loadtest/actions/workflows/trivy.yml) [![Go 1.26](https://img.shields.io/badge/Go-1.26-00ADD8?logo=go&logoColor=white)](https://go.dev/) [![Platform](https://img.shields.io/badge/platform-linux%2Famd64-blue)](https://github.com/yarilomail/yarilo-loadtest) [![License: AGPL v3](https://img.shields.io/badge/license-AGPLv3-blue.svg)](LICENSE) ![Status: beta](https://img.shields.io/badge/status-beta-orange)
 
 Load generator for [yarilo](https://github.com/yarilomail/yarilo): protocol
-drivers with per-command latency statistics.
+drivers with per-command latency statistics, and a watchdog that captures a
+server the moment a run reports a stall.
 
 It is a **client**, deliberately outside the server repository and image. A load
 generator has no business shipping inside a mail server, and keeping it separate
@@ -23,6 +24,24 @@ So the message corpus is configurable by size and attachment ratio, and seeded,
 so a before/after comparison compares one thing.
 
 ## Status
+
+Beta. Every driver below is implemented and this is the tool the server's
+release gate is measured with — the badge said alpha long after that stopped
+being true.
+
+Beta rather than stable because the contracts are not all fixed yet. What a
+caller may rely on today:
+
+- **the exit status** — non-zero when any protocol error occurred, which is how
+  a Job gates on a run;
+- **`-json`** — the summary on stdout, machine-readable, with the live table
+  kept on stderr so a run watched by a human and a run parsed by a job are the
+  same run.
+
+Flag names and the shape of the human-readable table may still change before
+1.0. The generated corpus may change too: a Message-ID now carries the
+recipient, so mail from one seed is not byte-identical to mail from the same
+seed before 0.8.0.
 
 | Driver | State |
 |:---|:---|
@@ -118,6 +137,13 @@ Two sources, for two different questions.
 seed makes the corpus reproducible byte for byte. Use it when the question is
 "how does cost scale with message size", which is what the size flags exist for.
 
+A generated `Message-ID` carries the recipient as well as the seed and the
+sequence number. Without that, seeding two ranges of mailboxes with one seed
+gave every message a twin elsewhere — same identifier, different `To` — and any
+client that caches by `Message-ID` reported the envelope as having changed. One
+seed and one recipient still render the same bytes; that is the promise a seed
+actually makes.
+
 **Replayed** — `-mbox=/path/to/test.mbox` delivers the messages in an mbox file,
 cycling. Use it when the question is "is this server slower than that one":
 comparing two runs means comparing the same work, and the same corpus is the
@@ -196,6 +222,53 @@ server refusing everything as a healthy one.
 alone — on the server, the difference between an index lookup and going to the
 message store — and `-threads` adds a `Thread/get` for what the query returned.
 
+### stall-watch
+
+Not a driver: it drives nothing and measures nothing. It watches a run somebody
+else is driving and snapshots the servers the moment that run reports a stalled
+command.
+
+```sh
+sed 's/TARGET_JOB/imaptest-mdbox/' hack/stall-watch.yaml | kubectl -n yarilo-sb apply -f -
+```
+
+The target goes in **before** the Job is created. A Job's `spec.template` is
+immutable, so `kubectl set env job/stall-watch …` is refused — edit the
+manifest, or pipe it through `sed` as above. To retarget a watch that is already
+running, delete it and apply again.
+
+It runs **inside the cluster**, reading the target run's log through the API
+server with its own read-only service account. That is not tidiness either: a
+watch running on an operator's machine ends when the link drops, and it drops
+at the moment it matters. Captures go to a volume that outlives the pod.
+
+Per trigger, for every backend: the goroutine dump at `debug=2`, which names the
+parked stack; a metrics snapshot; the container's cgroup `cpu.stat` when the
+node's cgroupfs is mounted; and one CPU profile. Captures are rate-limited so a
+burst of stalls cannot bury the first one, and the run is never interrupted.
+
+**By event rather than on a timer**, because the stall it was written for lasted
+minutes and appeared twice in a day: three captures taken on a schedule all
+landed on a healthy server, and a dump taken after a run says nothing at all —
+the parked goroutine is gone by then.
+
+The dump and the profile need `telemetry.pprof.enabled` on the backends. With it
+off the metrics snapshot still arrives and those two files are simply missing,
+which reads as a quiet server rather than as a switch nobody turned on.
+
+The metrics snapshot earns its place: in the case this was built for, the
+goroutine dumps came back empty and it was the metrics that named the mechanism.
+
+| Variable | Default | Meaning |
+|:---|:---|:---|
+| `TARGET` | — | `job-name` of the run to watch; required |
+| `NS` | `yarilo-sb` | namespace |
+| `OUT` | `/caps` | where captures are written |
+| `COOLDOWN` | `60` | seconds between captures |
+| `PROFILE_SECS` | `30` | length of the CPU profile |
+| `TELEMETRY_PORT` | `8080` | port `/metrics` and `/debug/pprof` are served on |
+| `PATTERN` | `stalled (>3s\|for \d+ secs)` | log lines that trigger a capture |
+
 ### Live output
 
 A line per interval on stderr while the run is going, with a column per command
@@ -267,7 +340,7 @@ Kubernetes Job fails without anything parsing the output.
 
 | Flag | Default | Meaning |
 |:---|:---|:---|
-| `-protocol` | — | driver to run (`lmtp`) |
+| `-protocol` | — | driver to run: `lmtp`, `imap`, `pop3`, `jmap` |
 | `-addr` | — | `host:port` of the target listener |
 | `-concurrency` | 10 | concurrent clients |
 | `-duration` | — | run for this long |
