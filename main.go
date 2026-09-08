@@ -8,11 +8,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -39,7 +41,7 @@ var (
 	flagStopOnError = flag.Bool("stop-on-error", false, "end the run at the first protocol error")
 	flagTimeout     = flag.Duration("timeout", 30*time.Second, "per-command timeout")
 
-	flagRecipients = flag.String("recipients", "", "comma-separated LMTP recipients, or user@domain:N to expand u1..uN")
+	flagRecipients = flag.String("recipients", "", "comma-separated LMTP recipients, or user<N>@domain:count to expand count addresses from N")
 	flagSender     = flag.String("sender", "loadtest@yarilo.invalid", "envelope sender")
 	flagRcptPerMsg = flag.Int("recipients-per-message", 1, "RCPT TO lines per delivery")
 
@@ -48,7 +50,7 @@ var (
 	flagAttachRate = flag.Float64("attachment-ratio", 0, "fraction of messages carrying a base64 attachment, 0..1")
 	flagSeed       = flag.Int64("seed", 0, "corpus seed; the same seed generates the same mail")
 
-	flagUsers      = flag.String("users", "", "comma-separated IMAP users, or user@domain:N to expand u1..uN")
+	flagUsers      = flag.String("users", "", "comma-separated IMAP users, or user<N>@domain:count to expand count addresses from N")
 	flagPassword   = flag.String("password", "", "password for every user")
 	flagTLS        = flag.Bool("tls", false, "connect with implicit TLS (IMAPS)")
 	flagInsecure   = flag.Bool("insecure", false, "skip TLS certificate verification")
@@ -152,7 +154,10 @@ func main() {
 }
 
 func runLMTP(ctx context.Context, c *stats.Collector, src corpus.Source) error {
-	rcpts := expandRecipients(*flagRecipients)
+	rcpts, rerr := expandRecipients("-recipients", *flagRecipients)
+	if rerr != nil {
+		fail("%v", rerr)
+	}
 	if len(rcpts) == 0 {
 		fail("-recipients is required for the lmtp driver")
 	}
@@ -191,7 +196,10 @@ func runLMTP(ctx context.Context, c *stats.Collector, src corpus.Source) error {
 // driver holds — a POP3 server locks the maildrop for the length of a session,
 // so a generator that stayed connected would measure its own lock contention.
 func runPOP3(ctx context.Context, c *stats.Collector) error {
-	users := expandRecipients(*flagUsers)
+	users, uerr := expandRecipients("-users", *flagUsers)
+	if uerr != nil {
+		fail("%v", uerr)
+	}
 	if len(users) == 0 {
 		fail("-users is required for the pop3 driver")
 	}
@@ -233,7 +241,10 @@ func runPOP3(ctx context.Context, c *stats.Collector) error {
 // -addr is a base URL here rather than host:port, because JMAP is HTTP and the
 // API endpoint is read out of the session resource rather than assembled.
 func runJMAP(ctx context.Context, c *stats.Collector) error {
-	users := expandRecipients(*flagUsers)
+	users, uerr := expandRecipients("-users", *flagUsers)
+	if uerr != nil {
+		fail("%v", uerr)
+	}
 	if len(users) == 0 {
 		fail("-users is required for the jmap driver")
 	}
@@ -297,7 +308,10 @@ func messageSource() (corpus.Source, error) {
 }
 
 func runIMAP(ctx context.Context, c *stats.Collector, src corpus.Source) error {
-	users := expandRecipients(*flagUsers)
+	users, uerr := expandRecipients("-users", *flagUsers)
+	if uerr != nil {
+		fail("%v", uerr)
+	}
 	if len(users) == 0 {
 		fail("-users is required for the imap driver")
 	}
@@ -359,10 +373,10 @@ func splitList(s string) []string {
 // expandRecipients accepts an explicit list or the "u@domain:N" shorthand that
 // matches how the sandbox names its accounts (u1..uN@domain), so a 150-user
 // run does not need a 150-entry command line.
-func expandRecipients(spec string) []string {
+func expandRecipients(flagName, spec string) ([]string, error) {
 	spec = strings.TrimSpace(spec)
 	if spec == "" {
-		return nil
+		return nil, nil
 	}
 	var out []string
 	for _, part := range strings.Split(spec, ",") {
@@ -380,11 +394,41 @@ func expandRecipients(spec string) []string {
 			out = append(out, part)
 			continue
 		}
-		for i := 1; i <= count; i++ {
-			out = append(out, fmt.Sprintf("%s%d@%s", local, i, domain))
+		// The number the local part ends in is where the run starts, so
+		// u51@d:100 is u51..u150 and not u511..u51100 (#34).
+		prefix, first, err := splitTrailingNumber(local)
+		if err != nil {
+			return nil, fmt.Errorf("%s %q: %w", flagName, part, err)
+		}
+		for i := 0; i < count; i++ {
+			out = append(out, fmt.Sprintf("%s%d@%s", prefix, first+i, domain))
 		}
 	}
-	return out
+	return out, nil
+}
+
+// splitTrailingNumber reads where the run starts: "u51" at 51, a part with no
+// number at 1, and "u0" or "u051" -- two readings each -- is refused (#34).
+func splitTrailingNumber(local string) (prefix string, first int, err error) {
+	i := len(local)
+	for i > 0 && local[i-1] >= '0' && local[i-1] <= '9' {
+		i--
+	}
+	if i == len(local) {
+		return local, 1, nil
+	}
+	digits := local[i:]
+	n, cerr := strconv.Atoi(digits)
+	if cerr != nil {
+		return "", 0, fmt.Errorf("the number %q cannot be read", digits)
+	}
+	if n == 0 {
+		return "", 0, errors.New("the run would start at zero; name the first address, as in u1@domain:N")
+	}
+	if len(digits) > 1 && digits[0] == '0' {
+		return "", 0, fmt.Errorf("%q is zero-padded, and the run would not keep the padding; write it out or drop the zeros", digits)
+	}
+	return local[:i], n, nil
 }
 
 // splitCount parses "u@example.com:150" into ("u@example.com", 150).
