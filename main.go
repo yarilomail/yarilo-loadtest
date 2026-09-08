@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -39,7 +40,7 @@ var (
 	flagStopOnError = flag.Bool("stop-on-error", false, "end the run at the first protocol error")
 	flagTimeout     = flag.Duration("timeout", 30*time.Second, "per-command timeout")
 
-	flagRecipients = flag.String("recipients", "", "comma-separated LMTP recipients, or user@domain:N to expand u1..uN")
+	flagRecipients = flag.String("recipients", "", "comma-separated LMTP recipients, or user<N>@domain:count to expand count addresses from N")
 	flagSender     = flag.String("sender", "loadtest@yarilo.invalid", "envelope sender")
 	flagRcptPerMsg = flag.Int("recipients-per-message", 1, "RCPT TO lines per delivery")
 
@@ -48,7 +49,7 @@ var (
 	flagAttachRate = flag.Float64("attachment-ratio", 0, "fraction of messages carrying a base64 attachment, 0..1")
 	flagSeed       = flag.Int64("seed", 0, "corpus seed; the same seed generates the same mail")
 
-	flagUsers      = flag.String("users", "", "comma-separated IMAP users, or user@domain:N to expand u1..uN")
+	flagUsers      = flag.String("users", "", "comma-separated IMAP users, or user<N>@domain:count to expand count addresses from N")
 	flagPassword   = flag.String("password", "", "password for every user")
 	flagTLS        = flag.Bool("tls", false, "connect with implicit TLS (IMAPS)")
 	flagInsecure   = flag.Bool("insecure", false, "skip TLS certificate verification")
@@ -380,11 +381,31 @@ func expandRecipients(spec string) []string {
 			out = append(out, part)
 			continue
 		}
-		for i := 1; i <= count; i++ {
-			out = append(out, fmt.Sprintf("%s%d@%s", local, i, domain))
+		// The number the local part ends in is where the run starts, so
+		// u51@d:100 is u51..u150 and not u511..u51100 (#1739).
+		prefix, first := splitTrailingNumber(local)
+		for i := 0; i < count; i++ {
+			out = append(out, fmt.Sprintf("%s%d@%s", prefix, first+i, domain))
 		}
 	}
 	return out
+}
+
+// splitTrailingNumber reads the run's first number off the local part: "u51"
+// starts at 51, and a local part with no number at all starts at 1.
+func splitTrailingNumber(local string) (prefix string, first int) {
+	i := len(local)
+	for i > 0 && local[i-1] >= '0' && local[i-1] <= '9' {
+		i--
+	}
+	if i == len(local) {
+		return local, 1
+	}
+	n, err := strconv.Atoi(local[i:])
+	if err != nil || n < 1 {
+		return local, 1
+	}
+	return local[:i], n
 }
 
 // splitCount parses "u@example.com:150" into ("u@example.com", 150).
