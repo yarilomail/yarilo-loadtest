@@ -1,7 +1,7 @@
 ## Pinned to the patch go.mod names: a scan reads go.mod, the image ships the
 ## base, and a floating base makes them disagree silently (yarilo#1497).
 ## Dependabot moves it.
-FROM golang:1.26.7-alpine AS builder
+FROM golang:1.26.8-alpine AS builder
 
 ## A newer go.mod must fail the build, not fetch a toolchain.
 ENV GOTOOLCHAIN=local
