@@ -23,12 +23,20 @@ func TestGoModAndDockerfileNameTheSameToolchain(t *testing.T) {
 	want := m[1]
 
 	dockerfile := readFile(t, filepath.Join(root, "Dockerfile"))
+	// golang:<version>-alpine<release>@sha256:<digest>: the version is what
+	// go.mod must name, and the digest keeps the base from moving under a tag.
 	stages := regexp.MustCompile(`(?m)^FROM golang:(\S+)`).FindAllStringSubmatch(dockerfile, -1)
 	if len(stages) == 0 {
 		t.Fatal("no golang base image in the Dockerfile; this guard is watching a file that moved")
 	}
+	version := regexp.MustCompile(`^(\d+\.\d+\.\d+)-alpine[0-9.]*@sha256:[0-9a-f]{64}$`)
 	for _, s := range stages {
-		if got := strings.TrimSuffix(s[1], "-alpine"); got != want {
+		v := version.FindStringSubmatch(s[1])
+		if v == nil {
+			t.Errorf("golang:%s is not <version>-alpine pinned by digest", s[1])
+			continue
+		}
+		if v[1] != want {
 			t.Errorf("the image builds on golang:%s, go.mod says %s", s[1], want)
 		}
 	}
