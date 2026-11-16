@@ -38,11 +38,12 @@ func dial(addr string, useTLS, insecure bool, timeout time.Duration) (*client, e
 		if sErr != nil {
 			host = addr
 		}
-		conn, err = tls.DialWithDialer(&d, "tcp", addr, &tls.Config{
+		td := tls.Dialer{NetDialer: &d, Config: &tls.Config{
 			ServerName:         host,
 			InsecureSkipVerify: insecure, //nolint:gosec // opt-in, for sandbox certs
 			MinVersion:         tls.VersionTLS12,
-		})
+		}}
+		conn, err = td.Dial("tcp", addr)
 	} else {
 		conn, err = d.Dial("tcp", addr)
 	}

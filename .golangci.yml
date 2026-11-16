@@ -1,18 +1,25 @@
+version: "2"
+
 run:
   timeout: 5m
 
+## v2 format, matching the server repo: staticcheck names SA and S1 (S1 was
+## gosimple in v1), and the presets keep v1's default exclusions, so the
+## ruleset carries over.
 linters:
   enable:
-    - errcheck
-    - govet
-    - ineffassign
-    - staticcheck
-    - unused
-    - gosimple
     - unconvert
     - misspell
     - noctx
-
-linters-settings:
-  errcheck:
-    check-type-assertions: true
+  settings:
+    errcheck:
+      check-type-assertions: true
+    staticcheck:
+      checks:
+        - SA*
+        - S1*
+  exclusions:
+    presets:
+      - common-false-positives
+      - legacy
+      - std-error-handling

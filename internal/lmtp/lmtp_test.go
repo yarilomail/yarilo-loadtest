@@ -39,7 +39,7 @@ type delivery struct {
 
 func (f *fakeLMTP) serve(t *testing.T) string {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
@@ -278,7 +278,7 @@ func keys(m map[string]bool) []string {
 // A server that refuses must surface as an error rather than a silent success:
 // a load run that counts refusals as throughput is worse than no run.
 func TestDeliverReportsARefusal(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}

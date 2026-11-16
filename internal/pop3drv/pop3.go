@@ -155,11 +155,12 @@ func dial(ctx context.Context, cfg Config) (*client, error) {
 		if sErr != nil {
 			host = cfg.Addr
 		}
-		conn, err = tls.DialWithDialer(&d, "tcp", cfg.Addr, &tls.Config{
+		td := tls.Dialer{NetDialer: &d, Config: &tls.Config{
 			ServerName:         host,
 			InsecureSkipVerify: cfg.Insecure, //nolint:gosec // opt-in, for sandbox certs
 			MinVersion:         tls.VersionTLS12,
-		})
+		}}
+		conn, err = td.DialContext(ctx, "tcp", cfg.Addr)
 	} else {
 		conn, err = d.DialContext(ctx, "tcp", cfg.Addr)
 	}
