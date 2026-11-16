@@ -143,6 +143,7 @@ jobs:
             type=raw,value=${{ steps.version.outputs.image_tag }},enable=${{ steps.version.outputs.is_release == 'true' }}
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v7.4.0
         with:
           context: .
@@ -153,8 +154,23 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # The runtime stage runs apk upgrade: rebuilt every time, the Go
+          # builder keeps the cache.
+          no-cache-filters: runtime
           build-args: |
             BUILD_VERSION=${{ steps.version.outputs.image_tag }}
+
+      ## The image just pushed, by its digest: the scheduled Trivy run builds
+      ## its own and can pass while this one, built from cached layers,
+      ## carries an old package.
+      - name: Trivy - the pushed image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: true
 
       - name: Generate release notes
         if: steps.version.outputs.is_release == 'true'
